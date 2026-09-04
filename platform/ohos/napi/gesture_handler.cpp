@@ -27,11 +27,11 @@ constexpr double MaxDoubleTapDistance = 48.0;
 constexpr double DoubleTapZoomScale = 2.0;
 constexpr auto DoubleTapAnimationDuration = std::chrono::milliseconds(300);
 constexpr double FlingAnimationBaseMilliseconds = 180.0;
-constexpr double MinFlingVelocity = 1000.0;
+constexpr double MinFlingVelocity = 400.0;
 constexpr double FlingVelocityDivisor = 7.0;
 constexpr double FlingTiltBaseFactor = 1.5;
 constexpr double FlingTiltScale = 10.0;
-constexpr double FlingOffsetFactor = 0.32;
+constexpr double FlingOffsetFactor = 0.42;
 constexpr double MaxFlingDistance = 1200.0;
 constexpr double FlingViewportMargin = 1.0;
 constexpr double FlingVerticalPitchLimitScale = 90.0;
@@ -201,6 +201,7 @@ bool handleTouchAction(GestureState& state,
         state.pinchAngle = pinch->angle;
         if (mapView) {
             mapView->setGestureInProgress(true);
+            mapView->beginInteractionZoom();
         }
     };
 
@@ -208,7 +209,7 @@ bool handleTouchAction(GestureState& state,
         case TouchAction::Down: {
             if (pinch) {
                 beginPinch();
-                return false;
+                return true;
             }
             if (!point) {
                 return false;
@@ -229,6 +230,7 @@ bool handleTouchAction(GestureState& state,
             if (mapView) {
                 mapView->setGestureInProgress(true);
             }
+            needsRender = true;
             break;
         }
         case TouchAction::Move: {
@@ -267,6 +269,8 @@ bool handleTouchAction(GestureState& state,
                     return true;
                 }
 
+                const double currentZoom = mapView->getCameraOptions().zoom.value_or(0.0);
+                mapView->prepareInteractionZoom(currentZoom + std::log2(scale));
                 mapView->scaleBy(scale, pinch->centerX, pinch->centerY);
                 mapView->rotateBy(previousAngle, pinch->angle, pinch->centerX, pinch->centerY);
                 mapView->moveBy(dx, dy);
@@ -311,7 +315,11 @@ bool handleTouchAction(GestureState& state,
             state.pinchActive = false;
             state.shoveActive = false;
             if (mapView) {
+                // Finger is up. MapView::syncGestureFlag keeps MapLibre's
+                // gestureInProgress set while isPanning/isScaling (fling,
+                // double-tap fly) so symbol placement stays deferred.
                 mapView->setGestureInProgress(false);
+                mapView->endInteractionZoom();
                 if (!canHandleTap || !handleTap(*point)) {
                     if (shouldFling) {
                         const double pitch = mapView->getCameraOptions().pitch.value_or(0.0);

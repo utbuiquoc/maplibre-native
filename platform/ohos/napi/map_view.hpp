@@ -8,11 +8,14 @@
 #include <mbgl/map/map.hpp>
 #include <mbgl/map/map_observer.hpp>
 #include <mbgl/storage/resource_options.hpp>
+#include <mbgl/util/async_task.hpp>
 #include <mbgl/util/size.hpp>
 
 #include <native_window/external_window.h>
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,6 +35,7 @@ public:
     void setSurface(OHNativeWindow*, Size);
     void clearSurface();
     bool renderFrame();
+    void pumpEvents();
     void reduceMemoryUse();
 
     void setStyleURL(const std::string&);
@@ -42,6 +46,15 @@ public:
     void fitBounds(CameraBoundsOptions);
     void setFreeCameraOptions(FreeCameraOptions);
     void setGestureInProgress(bool);
+    bool isGestureInProgress() const;
+    bool isPanning() const;
+    bool isScaling() const;
+    bool isRotating() const;
+    bool isInteractive() const;
+    void addZoomDelta(double deltaZoom);
+    void beginInteractionZoom();
+    void prepareInteractionZoom(double nextZoom);
+    void endInteractionZoom();
     void moveBy(double x, double y, AnimationOptions = {});
     void pitchBy(double deltaPitch);
     void scaleBy(double scale, double anchorX, double anchorY);
@@ -54,6 +67,7 @@ public:
     void setTileCacheEnabled(bool);
     void setPixelRatio(float);
     void setSize(Size);
+    void setRepaintCallback(std::function<void()> callback);
 
     bool hasMap() const { return map != nullptr; }
     OHNativeWindow* getNativeWindow() const { return window; }
@@ -86,9 +100,26 @@ private:
     CameraOptions mergeCameraOptions(const CameraOptions&) const;
     FreeCameraOptions mergeFreeCameraOptions(const FreeCameraOptions&) const;
     BoundOptions mergeBoundOptions(const BoundOptions&) const;
+    enum class ZoomSessionOwner { None, Wheel, Pinch };
+
+    struct ZoomSession {
+        bool active = false;
+        ZoomSessionOwner owner = ZoomSessionOwner::None;
+        double pendingDelta = 0.0;
+        std::chrono::steady_clock::time_point lastEvent{};
+    };
+
     void applyDesiredBounds();
     void applyDesiredCamera();
     void runLoopOnce();
+    void tickZoomSession();
+    void startZoomSession(ZoomSessionOwner);
+    void applyPendingZoomDelta();
+    void applyTileLodShift(double nextZoom);
+    void applyCoveringZoomCap();
+    void finishZoomSession();
+    void syncGestureFlag();
+    double currentZoom() const;
 
     void onDidFailLoadingMap(MapLoadError, const std::string&) override;
     void onDidFinishLoadingMap() override;
@@ -99,6 +130,7 @@ private:
     void onRenderError(std::exception_ptr) override;
 
     void resetRuntimeState();
+    void onInvalidate();
 
     float pixelRatio = 1.0f;
     OHNativeWindow* window = nullptr;
@@ -123,6 +155,10 @@ private:
     std::string clientName;
     std::string clientVersion;
     ResourceOptions resourceOptions;
+    ZoomSession zoomSession;
+    bool touchGestureActive = false;
+    std::function<void()> repaintCallback;
+    std::unique_ptr<util::AsyncTask> asyncInvalidate;
 };
 
 } // namespace ohos

@@ -36,6 +36,13 @@ void RendererFrontend::setObserver(RendererObserver& observer) {
 void RendererFrontend::update(std::shared_ptr<UpdateParameters> params) {
     updateParameters = std::move(params);
     needsRender = true;
+    if (invalidateCallback) {
+        invalidateCallback();
+    }
+}
+
+void RendererFrontend::setInvalidateCallback(std::function<void()> callback) {
+    invalidateCallback = std::move(callback);
 }
 
 const TaggedScheduler& RendererFrontend::getThreadPool() const {

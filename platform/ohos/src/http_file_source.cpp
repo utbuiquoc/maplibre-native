@@ -1,4 +1,5 @@
 #include "http_user_agent.hpp"
+#include "http_bridge.hpp"
 
 #include <mbgl/storage/http_file_source.hpp>
 #include <mbgl/storage/resource.hpp>
@@ -23,10 +24,82 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <utility>
+#include <dlfcn.h>
+#include <hilog/log.h>
 
 namespace mbgl {
 namespace {
+
+struct NetHttpApi {
+    Http_Request* (*CreateRequest)(const char* url) = nullptr;
+    Http_Headers* (*CreateHeaders)() = nullptr;
+    uint32_t (*SetHeaderValue)(Http_Headers* headers, const char* key, const char* value) = nullptr;
+    Http_HeaderEntry* (*GetHeaderEntries)(Http_Headers* headers) = nullptr;
+    void (*DestroyHeaderEntries)(Http_HeaderEntry** headerEntries) = nullptr;
+    void (*DestroyHeaders)(Http_Headers** headers) = nullptr;
+    void (*Destroy)(Http_Request** request) = nullptr;
+    int (*Request)(Http_Request* request, Http_ResponseCallback callback, Http_EventsHandler eventsHandler) = nullptr;
+
+    bool valid() const {
+        return CreateRequest && CreateHeaders && SetHeaderValue && GetHeaderEntries &&
+               DestroyHeaderEntries && DestroyHeaders && Destroy && Request;
+    }
+};
+
+static const NetHttpApi& getNetHttpApi() {
+    static NetHttpApi api = []() {
+        NetHttpApi result{};
+        void* handle = nullptr;
+        const char* candidateLibs[] = {
+            "libnet_http.z.so",
+            "libnet_http.so",
+            "libhttp_client.z.so",
+            "libnetstack.z.so",
+            "libnet_connection.z.so",
+            "libnet_ssl.z.so",
+            "libhttp.z.so",
+            "/system/lib64/libnet_http.z.so",
+            "/system/lib64/platformsdk/libnet_http.z.so",
+            "/system/lib64/ndk/libnet_http.z.so",
+            "/system/lib64/module/net/libhttp.z.so",
+            "/system/lib64/module/net/libnet_http.z.so",
+            "/system/lib/libnet_http.z.so",
+            "/system/lib/module/net/libhttp.z.so"
+        };
+        for (const char* name : candidateLibs) {
+            handle = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
+            if (handle) {
+                OH_LOG_PrintMsg(LOG_APP, LOG_INFO, 0x4d4c, "MapLibreNet", (std::string("dlopen succeeded for: ") + name).c_str());
+                break;
+            } else {
+                const char* err = dlerror();
+                OH_LOG_PrintMsg(LOG_APP, LOG_DEBUG, 0x4d4c, "MapLibreNet", (std::string("dlopen failed for ") + name + ": " + (err ? err : "null")).c_str());
+            }
+        }
+        if (!handle) {
+            handle = RTLD_DEFAULT;
+            OH_LOG_PrintMsg(LOG_APP, LOG_WARN, 0x4d4c, "MapLibreNet", "Falling back to RTLD_DEFAULT for net_http symbols");
+        }
+
+        result.CreateRequest = reinterpret_cast<decltype(result.CreateRequest)>(dlsym(handle, "OH_Http_CreateRequest"));
+        result.CreateHeaders = reinterpret_cast<decltype(result.CreateHeaders)>(dlsym(handle, "OH_Http_CreateHeaders"));
+        result.SetHeaderValue = reinterpret_cast<decltype(result.SetHeaderValue)>(dlsym(handle, "OH_Http_SetHeaderValue"));
+        result.GetHeaderEntries = reinterpret_cast<decltype(result.GetHeaderEntries)>(dlsym(handle, "OH_Http_GetHeaderEntries"));
+        result.DestroyHeaderEntries = reinterpret_cast<decltype(result.DestroyHeaderEntries)>(dlsym(handle, "OH_Http_DestroyHeaderEntries"));
+        result.DestroyHeaders = reinterpret_cast<decltype(result.DestroyHeaders)>(dlsym(handle, "OH_Http_DestroyHeaders"));
+        result.Destroy = reinterpret_cast<decltype(result.Destroy)>(dlsym(handle, "OH_Http_Destroy"));
+        result.Request = reinterpret_cast<decltype(result.Request)>(dlsym(handle, "OH_Http_Request"));
+
+        OH_LOG_PrintMsg(LOG_APP, LOG_INFO, 0x4d4c, "MapLibreNet",
+            (std::string("Symbols resolved: CreateReq=") + (result.CreateRequest ? "YES" : "NO") +
+             ", CreateHead=" + (result.CreateHeaders ? "YES" : "NO") +
+             ", SetHead=" + (result.SetHeaderValue ? "YES" : "NO") +
+             ", Request=" + (result.Request ? "YES" : "NO")).c_str());
+
+        return result;
+    }();
+    return api;
+}
 
 constexpr std::size_t kMaxActiveRequests = 128;
 constexpr std::size_t kCallbackGenerations = 64;
@@ -57,7 +130,7 @@ std::optional<std::string> headerValue(Http_Headers* headers, const char* name) 
     }
 
     const auto expected = toLowerASCII(name);
-    Http_HeaderEntry* entries = OH_Http_GetHeaderEntries(headers);
+    Http_HeaderEntry* entries = getNetHttpApi().GetHeaderEntries ? getNetHttpApi().GetHeaderEntries(headers) : nullptr;
     if (!entries) {
         return std::nullopt;
     }
@@ -79,11 +152,15 @@ std::optional<std::string> headerValue(Http_Headers* headers, const char* name) 
             value += item->value;
         }
 
-        OH_Http_DestroyHeaderEntries(&entriesToDestroy);
+        if (getNetHttpApi().DestroyHeaderEntries) {
+            getNetHttpApi().DestroyHeaderEntries(&entriesToDestroy);
+        }
         return value;
     }
 
-    OH_Http_DestroyHeaderEntries(&entriesToDestroy);
+    if (getNetHttpApi().DestroyHeaderEntries) {
+        getNetHttpApi().DestroyHeaderEntries(&entriesToDestroy);
+    }
     return std::nullopt;
 }
 
@@ -306,6 +383,30 @@ constexpr auto makeCanceledCallbacks(std::index_sequence<Tokens...>) {
 constexpr auto responseCallbacks = makeResponseCallbacks(std::make_index_sequence<kCallbackTokens>{});
 constexpr auto canceledCallbacks = makeCanceledCallbacks(std::make_index_sequence<kCallbackTokens>{});
 
+class RequestState;
+
+static std::mutex g_pendingBridgeMutex;
+static std::unordered_map<uint64_t, std::weak_ptr<RequestState>> g_pendingBridgeRequests;
+
+void registerPendingBridgeRequest(uint64_t id, std::shared_ptr<RequestState> state) {
+    std::lock_guard<std::mutex> lock(g_pendingBridgeMutex);
+    g_pendingBridgeRequests[id] = state;
+}
+
+void unregisterPendingBridgeRequest(uint64_t id) {
+    std::lock_guard<std::mutex> lock(g_pendingBridgeMutex);
+    g_pendingBridgeRequests.erase(id);
+}
+
+std::shared_ptr<RequestState> getPendingBridgeRequest(uint64_t id) {
+    std::lock_guard<std::mutex> lock(g_pendingBridgeMutex);
+    auto it = g_pendingBridgeRequests.find(id);
+    if (it != g_pendingBridgeRequests.end()) {
+        return it->second.lock();
+    }
+    return nullptr;
+}
+
 class RequestState : public std::enable_shared_from_this<RequestState> {
 public:
     RequestState(util::RunLoop& runLoop_, Resource resource_, std::string userAgent_, FileSource::Callback callback_)
@@ -319,7 +420,92 @@ public:
             std::scoped_lock lock(mutex);
             self = shared_from_this();
         }
-        SlotPool::enqueueOrStart(shared_from_this());
+        // Wearable registers an ArkTS HTTP bridge before createMap. Prefer it
+        // and skip native net_http (short-circuit avoids dlopen on that path).
+        if (ohos::hasHttpBridge() || !getNetHttpApi().valid()) {
+            startBridgeRequest();
+        } else {
+            SlotPool::enqueueOrStart(shared_from_this());
+        }
+    }
+
+    void startBridgeRequest() {
+        static std::atomic<uint64_t> g_nextBridgeId{1};
+        bridgeId = g_nextBridgeId++;
+
+        registerPendingBridgeRequest(bridgeId, shared_from_this());
+
+        std::vector<std::pair<std::string, std::string>> reqHeaders;
+        reqHeaders.emplace_back("Accept-Encoding", "gzip, deflate");
+        reqHeaders.emplace_back("User-Agent", userAgent);
+
+        if (resource.dataRange) {
+            reqHeaders.emplace_back("Range", std::string{"bytes="} + util::toString(resource.dataRange->first) + "-" +
+                                                  util::toString(resource.dataRange->second));
+        }
+        if (resource.priorEtag) {
+            reqHeaders.emplace_back("If-None-Match", *resource.priorEtag);
+        } else if (resource.priorModified) {
+            reqHeaders.emplace_back("If-Modified-Since", util::rfc1123(*resource.priorModified));
+        }
+
+        ohos::HttpBridgeRequest req{bridgeId, resource.url, std::move(reqHeaders)};
+        ohos::sendHttpBridgeRequest(req);
+    }
+
+    void onBridgeResponse(int statusCode,
+                          const char* data,
+                          size_t size,
+                          const std::map<std::string, std::string>& resHeaders,
+                          const std::string& errorMsg) {
+        Response response;
+        if (!errorMsg.empty() || statusCode == 0) {
+            response.error = std::make_unique<Response::Error>(
+                Response::Error::Reason::Connection, errorMsg.empty() ? "Network offline" : errorMsg);
+        } else if (statusCode == 200 || statusCode == 206) {
+            if (data && size > 0) {
+                response.data = std::make_shared<std::string>(data, size);
+            } else {
+                response.data = std::make_shared<std::string>();
+            }
+        } else if (statusCode == 204 || (statusCode == 404 && resource.kind == Resource::Kind::Tile)) {
+            response.noContent = true;
+        } else if (statusCode == 304) {
+            response.notModified = true;
+        } else if (statusCode == 404) {
+            response.error = std::make_unique<Response::Error>(Response::Error::Reason::NotFound, "HTTP status code 404");
+        } else if (statusCode >= 500 && statusCode < 600) {
+            response.error = std::make_unique<Response::Error>(Response::Error::Reason::Server,
+                                                               "HTTP status code " + std::to_string(statusCode));
+        } else {
+            response.error = std::make_unique<Response::Error>(Response::Error::Reason::Other,
+                                                               "HTTP status code " + std::to_string(statusCode));
+        }
+
+        for (const auto& kv : resHeaders) {
+            const auto key = toLowerASCII(kv.first.c_str());
+            if (key == "etag") {
+                response.etag = kv.second;
+            } else if (key == "expires") {
+                response.expires = util::parseTimestamp(kv.second.c_str());
+            } else if (key == "last-modified") {
+                response.modified = util::parseTimestamp(kv.second.c_str());
+            } else if (key == "cache-control") {
+                const auto cc = http::CacheControl::parse(kv.second);
+                if (cc.maxAge) {
+                    response.expires = cc.toTimePoint();
+                }
+                response.mustRevalidate = cc.mustRevalidate;
+            }
+        }
+
+        // Tối ưu Offline Cache: Mặc định giữ tile trong SQLite cache ít nhất 30 ngày
+        if (!response.expires && (statusCode == 200 || statusCode == 206)) {
+            response.expires = util::now() + Seconds(30 * 86400);
+        }
+
+        unregisterPendingBridgeRequest(bridgeId);
+        finish(std::move(response));
     }
 
     void setSlot(std::size_t token_) {
@@ -353,23 +539,29 @@ public:
             return;
         }
 
-        Http_Request* newRequest = OH_Http_CreateRequest(resource.url.c_str());
+        Http_Request* newRequest = getNetHttpApi().CreateRequest ? getNetHttpApi().CreateRequest(resource.url.c_str()) : nullptr;
         if (!newRequest) {
             complete(nullptr, OH_HTTP_OUT_OF_MEMORY);
             return;
         }
 
-        Http_Headers* newHeaders = OH_Http_CreateHeaders();
+        Http_Headers* newHeaders = getNetHttpApi().CreateHeaders ? getNetHttpApi().CreateHeaders() : nullptr;
         if (!newHeaders) {
-            OH_Http_Destroy(&newRequest);
+            if (getNetHttpApi().Destroy) {
+                getNetHttpApi().Destroy(&newRequest);
+            }
             complete(nullptr, OH_HTTP_OUT_OF_MEMORY);
             return;
         }
 
         if (!setHeader(newHeaders, "Accept-Encoding", "gzip, deflate") ||
             !setHeader(newHeaders, "User-Agent", userAgent.c_str())) {
-            OH_Http_DestroyHeaders(&newHeaders);
-            OH_Http_Destroy(&newRequest);
+            if (getNetHttpApi().DestroyHeaders) {
+                getNetHttpApi().DestroyHeaders(&newHeaders);
+            }
+            if (getNetHttpApi().Destroy) {
+                getNetHttpApi().Destroy(&newRequest);
+            }
             complete(nullptr, OH_HTTP_OUT_OF_MEMORY);
             return;
         }
@@ -378,8 +570,12 @@ public:
             const auto range = std::string{"bytes="} + util::toString(resource.dataRange->first) + "-" +
                                util::toString(resource.dataRange->second);
             if (!setHeader(newHeaders, "Range", range.c_str())) {
-                OH_Http_DestroyHeaders(&newHeaders);
-                OH_Http_Destroy(&newRequest);
+                if (getNetHttpApi().DestroyHeaders) {
+                    getNetHttpApi().DestroyHeaders(&newHeaders);
+                }
+                if (getNetHttpApi().Destroy) {
+                    getNetHttpApi().Destroy(&newRequest);
+                }
                 complete(nullptr, OH_HTTP_OUT_OF_MEMORY);
                 return;
             }
@@ -387,16 +583,24 @@ public:
 
         if (resource.priorEtag) {
             if (!setHeader(newHeaders, "If-None-Match", resource.priorEtag->c_str())) {
-                OH_Http_DestroyHeaders(&newHeaders);
-                OH_Http_Destroy(&newRequest);
+                if (getNetHttpApi().DestroyHeaders) {
+                    getNetHttpApi().DestroyHeaders(&newHeaders);
+                }
+                if (getNetHttpApi().Destroy) {
+                    getNetHttpApi().Destroy(&newRequest);
+                }
                 complete(nullptr, OH_HTTP_OUT_OF_MEMORY);
                 return;
             }
         } else if (resource.priorModified) {
             const auto modified = util::rfc1123(*resource.priorModified);
             if (!setHeader(newHeaders, "If-Modified-Since", modified.c_str())) {
-                OH_Http_DestroyHeaders(&newHeaders);
-                OH_Http_Destroy(&newRequest);
+                if (getNetHttpApi().DestroyHeaders) {
+                    getNetHttpApi().DestroyHeaders(&newHeaders);
+                }
+                if (getNetHttpApi().Destroy) {
+                    getNetHttpApi().Destroy(&newRequest);
+                }
                 complete(nullptr, OH_HTTP_OUT_OF_MEMORY);
                 return;
             }
@@ -408,8 +612,12 @@ public:
         {
             std::scoped_lock lock(mutex);
             if (canceled) {
-                OH_Http_DestroyHeaders(&newHeaders);
-                OH_Http_Destroy(&newRequest);
+                if (getNetHttpApi().DestroyHeaders) {
+                    getNetHttpApi().DestroyHeaders(&newHeaders);
+                }
+                if (getNetHttpApi().Destroy) {
+                    getNetHttpApi().Destroy(&newRequest);
+                }
                 finished = true;
             } else {
                 proxy.proxyType = HTTP_PROXY_SYSTEM;
@@ -432,7 +640,7 @@ public:
             return;
         }
 
-        const int result = OH_Http_Request(newRequest, SlotPool::responseCallback(*activeToken), handler);
+        const int result = getNetHttpApi().Request ? getNetHttpApi().Request(newRequest, SlotPool::responseCallback(*activeToken), handler) : OH_HTTP_OUT_OF_MEMORY;
         {
             std::scoped_lock lock(mutex);
             starting = false;
@@ -451,6 +659,11 @@ public:
     }
 
     void cancel() {
+        if (bridgeId != 0) {
+            ohos::cancelHttpBridgeRequest(bridgeId);
+            unregisterPendingBridgeRequest(bridgeId);
+        }
+
         Http_Request* requestToDestroy = nullptr;
         Http_Headers* headersToDestroy = nullptr;
         std::optional<std::size_t> activeToken;
@@ -488,11 +701,11 @@ public:
             }
         }
 
-        if (requestToDestroy) {
-            OH_Http_Destroy(&requestToDestroy);
+        if (requestToDestroy && getNetHttpApi().Destroy) {
+            getNetHttpApi().Destroy(&requestToDestroy);
         }
-        if (headersToDestroy) {
-            OH_Http_DestroyHeaders(&headersToDestroy);
+        if (headersToDestroy && getNetHttpApi().DestroyHeaders) {
+            getNetHttpApi().DestroyHeaders(&headersToDestroy);
         }
         if (activeToken && !shouldWaitForNativeCallback) {
             SlotPool::release(*activeToken, this);
@@ -514,7 +727,7 @@ public:
 
 private:
     static bool setHeader(Http_Headers* headers, const char* name, const char* value) {
-        return OH_Http_SetHeaderValue(headers, name, value) == OH_HTTP_RESULT_OK;
+        return getNetHttpApi().SetHeaderValue ? (getNetHttpApi().SetHeaderValue(headers, name, value) == OH_HTTP_RESULT_OK) : false;
     }
 
     std::optional<std::size_t> getToken() const {
@@ -547,11 +760,11 @@ private:
             }
         }
 
-        if (requestToDestroy) {
-            OH_Http_Destroy(&requestToDestroy);
+        if (requestToDestroy && getNetHttpApi().Destroy) {
+            getNetHttpApi().Destroy(&requestToDestroy);
         }
-        if (headersToDestroy) {
-            OH_Http_DestroyHeaders(&headersToDestroy);
+        if (headersToDestroy && getNetHttpApi().DestroyHeaders) {
+            getNetHttpApi().DestroyHeaders(&headersToDestroy);
         }
         if (!requestToDestroy) {
             const auto activeToken = getToken();
@@ -585,11 +798,11 @@ private:
             shouldCallback = response && !canceled && static_cast<bool>(callback);
         }
 
-        if (requestToDestroy) {
-            OH_Http_Destroy(&requestToDestroy);
+        if (requestToDestroy && getNetHttpApi().Destroy) {
+            getNetHttpApi().Destroy(&requestToDestroy);
         }
-        if (headersToDestroy) {
-            OH_Http_DestroyHeaders(&headersToDestroy);
+        if (headersToDestroy && getNetHttpApi().DestroyHeaders) {
+            getNetHttpApi().DestroyHeaders(&headersToDestroy);
         }
         if (activeToken) {
             SlotPool::release(*activeToken, this);
@@ -637,6 +850,7 @@ private:
     bool finished = false;
     bool starting = false;
     bool awaitingNativeCallback = false;
+    uint64_t bridgeId = 0;
 };
 
 std::mutex SlotPool::mutex;
@@ -773,6 +987,22 @@ private:
 };
 
 } // namespace
+
+namespace ohos {
+
+void dispatchHttpResponse(uint64_t id,
+                          int statusCode,
+                          const char* data,
+                          size_t size,
+                          const std::map<std::string, std::string>& headers,
+                          const std::string& errorMsg) {
+    auto state = getPendingBridgeRequest(id);
+    if (state) {
+        state->onBridgeResponse(statusCode, data, size, headers, errorMsg);
+    }
+}
+
+} // namespace ohos
 
 class HTTPFileSource::Impl {
 public:

@@ -3,6 +3,7 @@
 #include <mbgl/gfx/renderer_backend.hpp>
 #include <mbgl/renderer/renderer_frontend.hpp>
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -28,6 +29,7 @@ public:
 
     bool renderFrame();
     bool hasPendingRender() const;
+    void setInvalidateCallback(std::function<void()> callback);
     void setTileCacheEnabled(bool);
     void reduceMemoryUse();
 
@@ -35,6 +37,7 @@ private:
     gfx::RendererBackend& backend;
     std::unique_ptr<Renderer> renderer;
     std::shared_ptr<UpdateParameters> updateParameters;
+    std::function<void()> invalidateCallback;
     bool needsRender = false;
 };
 

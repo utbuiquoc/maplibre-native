@@ -2,23 +2,32 @@
 
 #include "gesture_handler.hpp"
 #include "native_values.hpp"
+#include "http_bridge.hpp"
+#include "watch_render_policy.hpp"
 
 #include <mbgl/storage/resource_options.hpp>
+#include <mbgl/util/async_task.hpp>
 #include <mbgl/util/logging.hpp>
+#include <mbgl/util/run_loop.hpp>
 #include <mbgl/util/size.hpp>
+#include <mbgl/util/timer.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <dlfcn.h>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -32,6 +41,29 @@
 #include <native_window/external_window.h>
 
 namespace {
+
+using PFN_ArkUI_XComponent_FrameCallback = void (*)(ArkUI_NodeHandle node, std::uint64_t, std::uint64_t);
+using PFN_OH_ArkUI_XComponent_RegisterOnFrameCallback = int32_t (*)(ArkUI_NodeHandle node, PFN_ArkUI_XComponent_FrameCallback callback);
+using PFN_OH_ArkUI_XComponent_UnregisterOnFrameCallback = int32_t (*)(ArkUI_NodeHandle node);
+using PFN_OH_ArkUI_XComponent_SetExpectedFrameRateRange = int32_t (*)(ArkUI_NodeHandle node, OH_NativeXComponent_ExpectedRateRange* range);
+
+static PFN_OH_ArkUI_XComponent_RegisterOnFrameCallback getRegisterOnFrameCallback() {
+    static auto pfn = reinterpret_cast<PFN_OH_ArkUI_XComponent_RegisterOnFrameCallback>(
+        dlsym(RTLD_DEFAULT, "OH_ArkUI_XComponent_RegisterOnFrameCallback"));
+    return pfn;
+}
+
+static PFN_OH_ArkUI_XComponent_UnregisterOnFrameCallback getUnregisterOnFrameCallback() {
+    static auto pfn = reinterpret_cast<PFN_OH_ArkUI_XComponent_UnregisterOnFrameCallback>(
+        dlsym(RTLD_DEFAULT, "OH_ArkUI_XComponent_UnregisterOnFrameCallback"));
+    return pfn;
+}
+
+static PFN_OH_ArkUI_XComponent_SetExpectedFrameRateRange getSetExpectedFrameRateRange() {
+    static auto pfn = reinterpret_cast<PFN_OH_ArkUI_XComponent_SetExpectedFrameRateRange>(
+        dlsym(RTLD_DEFAULT, "OH_ArkUI_XComponent_SetExpectedFrameRateRange"));
+    return pfn;
+}
 
 using mbgl::ohos::createCameraOptionsObject;
 using mbgl::ohos::createStringValue;
@@ -245,6 +277,8 @@ mbgl::ohos::TouchAction toTouchAction(int32_t action) {
     }
 }
 
+void setInteractiveWake(bool wanted);
+
 class SurfaceController final : public std::enable_shared_from_this<SurfaceController> {
 public:
     static std::shared_ptr<SurfaceController> create(ArkUI_NodeHandle node_) {
@@ -288,10 +322,14 @@ public:
         }
 
         closed = true;
+        disarmRenderPump();
 
-        if (frameCallbackRegistered && node != nullptr &&
-            OH_ArkUI_XComponent_UnregisterOnFrameCallback(node) != ARKUI_ERROR_CODE_NO_ERROR) {
-            mbgl::Log::Warning(mbgl::Event::Setup, "Could not unregister XComponent frame callback");
+        if (frameCallbackRegistered && node != nullptr) {
+            if (auto unregisterFn = getUnregisterOnFrameCallback()) {
+                if (unregisterFn(node) != ARKUI_ERROR_CODE_NO_ERROR) {
+                    mbgl::Log::Warning(mbgl::Event::Setup, "Could not unregister XComponent frame callback");
+                }
+            }
         }
         frameCallbackRegistered = false;
 
@@ -356,7 +394,9 @@ public:
             return;
         }
 
-        updateSurface();
+        if (width > 0 && height > 0) {
+            updateSurface();
+        }
     }
 
     void onSurfaceChanged(OH_ArkUI_SurfaceHolder* eventHolder, std::uint64_t width_, std::uint64_t height_) {
@@ -369,6 +409,7 @@ public:
         height = height_;
         surfaceVisible = window != nullptr;
         updateSurface();
+        armRenderPump();
     }
 
     void onSurfaceDestroyed(OH_ArkUI_SurfaceHolder* eventHolder) {
@@ -377,6 +418,7 @@ public:
         }
 
         surfaceVisible = false;
+        disarmRenderPump();
         clearSurface();
         window = nullptr;
         width = 0;
@@ -389,7 +431,9 @@ public:
         }
 
         ++frameCallbackCount;
-        renderFrame();
+        // XComponent vsync is useful when it fires, but wearable hosts often
+        // stop after the first paint. Never GPU-render unbounded here.
+        renderFrameThrottled();
     }
 
     void handleNodeEvent(ArkUI_NodeEvent* event) {
@@ -402,16 +446,78 @@ public:
             return;
         }
 
-        auto touchEvent = createTouchEvent(inputEvent);
-        if (mbgl::ohos::handleTouchEvent(gesture, mapView.get(), touchEvent)) {
-            renderFrame();
+        lastTouchTime = std::chrono::steady_clock::now();
+        const bool cameraChanged = mbgl::ohos::handleTouchEvent(gesture, mapView.get(), createTouchEvent(inputEvent));
+        armRenderPump();
+        (void)cameraChanged;
+    }
+
+    void pumpEvents() {
+        if (!closed && mapView) {
+            mapView->pumpEvents();
         }
     }
 
+    bool interactiveNow() const { return isInteractive(); }
+
     void renderFrame() {
-        if (!closed && renderingEnabled && surfaceVisible && mapView) {
-            mapView->renderFrame();
+        if (closed || !mapView) {
+            return;
         }
+        // Always drain MapLibre's uv queue so HTTP/tile workers complete even
+        // before the XComponent surface exists. GPU work still requires a surface.
+        pumpEvents();
+        if (inRenderFrame || !renderingEnabled || !surfaceVisible || width == 0 || height == 0) {
+            return;
+        }
+        inRenderFrame = true;
+        try {
+            const auto gpuStart = std::chrono::steady_clock::now();
+            mapView->renderFrame();
+            lastGpuRender = std::chrono::steady_clock::now();
+            const double gpuMs = std::chrono::duration<double, std::milli>(lastGpuRender - gpuStart).count();
+            lastGpuMs = gpuMs;
+            if (gpuMs > maxGpuMs) {
+                maxGpuMs = gpuMs;
+            }
+            if (gpuMs >= mbgl::ohos::WatchRenderPolicy::gpuHitchMilliseconds) {
+                ++hitchCount;
+                mbgl::Log::Warning(mbgl::Event::Render,
+                                   "GPU hitch " + std::to_string(static_cast<int>(gpuMs)) + "ms interactive=" +
+                                       (isInteractive() ? "1" : "0"));
+            }
+        } catch (const std::exception& exception) {
+            lastSurfaceError = exception.what();
+            mbgl::Log::Error(mbgl::Event::Render, exception.what());
+        }
+        inRenderFrame = false;
+    }
+
+    void renderFrameThrottled() {
+        if (closed || !mapView || inThrottledRender) {
+            return;
+        }
+        inThrottledRender = true;
+        pumpEvents();
+        // Never restart a 0-delay uv timer from inside this callback: nested
+        // uv_run would re-enter until SIGSEGV. Switch cadence only.
+        if (isInteractive() != renderPumpInteractive || !renderPumpArmed) {
+            armRenderPump();
+        }
+        if (!mapView->hasPendingRender()) {
+            inThrottledRender = false;
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto minInterval = std::chrono::milliseconds(
+            isInteractive() ? mbgl::ohos::WatchRenderPolicy::gpuInteractiveMinIntervalMilliseconds
+                            : mbgl::ohos::WatchRenderPolicy::gpuIdleMinIntervalMilliseconds);
+        if (lastGpuRender.time_since_epoch().count() != 0 && now - lastGpuRender < minInterval) {
+            inThrottledRender = false;
+            return;
+        }
+        renderFrame();
+        inThrottledRender = false;
     }
 
     void reduceMemoryUse() {
@@ -435,8 +541,20 @@ public:
             return;
         }
 
+        lastCameraJumpTime = std::chrono::steady_clock::now();
         ensureMapView().jumpTo(std::move(cameraOptions));
+        armRenderPump();
         renderFrame();
+    }
+
+    void zoomBy(double deltaZoom) {
+        if (closed) {
+            return;
+        }
+
+        ensureMapView().addZoomDelta(deltaZoom);
+        armRenderPump();
+        renderFrameThrottled();
     }
 
     void setPixelRatio(float newPixelRatio) {
@@ -476,7 +594,10 @@ public:
 
         renderingEnabled = enabled;
         if (enabled) {
+            armRenderPump();
             renderFrame();
+        } else {
+            disarmRenderPump();
         }
     }
 
@@ -485,8 +606,11 @@ public:
             return false;
         }
 
-        if (OH_ArkUI_XComponent_SetExpectedFrameRateRange(node, range) != ARKUI_ERROR_CODE_NO_ERROR) {
-            return false;
+        if (auto pfn = getSetExpectedFrameRateRange()) {
+            OH_NativeXComponent_ExpectedRateRange mutableRange = range;
+            if (pfn(node, &mutableRange) != ARKUI_ERROR_CODE_NO_ERROR) {
+                return false;
+            }
         }
 
         frameRateRange = range;
@@ -576,6 +700,7 @@ public:
         const bool hasSurface = hasWindow && width > 0 && height > 0;
         const bool hasMap = mapView && mapView->hasMap();
         const bool needsRender = mapView && mapView->hasPendingRender();
+        const bool interactive = isInteractive();
         const bool styleLoaded = mapView && mapView->hasLoadedStyle();
         const bool mapLoaded = mapView && mapView->hasLoadedMap();
         const bool fullyLoaded = mapView && mapView->isFullyLoaded();
@@ -594,11 +719,15 @@ public:
         setBoolProperty(env, object, "hasSurface", hasSurface);
         setBoolProperty(env, object, "hasMap", hasMap);
         setBoolProperty(env, object, "needsRender", needsRender);
+        setBoolProperty(env, object, "interactive", interactive);
         setBoolProperty(env, object, "styleLoaded", styleLoaded);
         setBoolProperty(env, object, "mapLoaded", mapLoaded);
         setBoolProperty(env, object, "fullyLoaded", fullyLoaded);
         setDoubleProperty(env, object, "renderedFrameRate", renderedFrameRate);
         setDoubleProperty(env, object, "frameCallbackRate", frameCallbackRate);
+        setDoubleProperty(env, object, "lastGpuMs", lastGpuMs);
+        setDoubleProperty(env, object, "maxGpuMs", maxGpuMs);
+        setSizeProperty(env, object, "hitchCount", hitchCount);
         if (!backendLabel.empty()) {
             setStringProperty(env, object, "backend", backendLabel);
         }
@@ -656,10 +785,13 @@ private:
         }
         surfaceCallbackRegistered = true;
 
-        if (OH_ArkUI_XComponent_RegisterOnFrameCallback(node, onFrame) != ARKUI_ERROR_CODE_NO_ERROR) {
-            throw std::runtime_error("Could not register XComponent frame callback");
+        if (auto registerFn = getRegisterOnFrameCallback()) {
+            if (registerFn(node, onFrame) == ARKUI_ERROR_CODE_NO_ERROR) {
+                frameCallbackRegistered = true;
+            } else {
+                mbgl::Log::Warning(mbgl::Event::Setup, "Could not register XComponent frame callback");
+            }
         }
-        frameCallbackRegistered = true;
 
         auto& api = requireNativeNodeApi();
         if (api.addNodeEventReceiver(node, onNodeEvent) != ARKUI_ERROR_CODE_NO_ERROR) {
@@ -716,7 +848,16 @@ private:
         }
     }
 
-    float coordinateScale() const { return std::isfinite(pixelRatio) && pixelRatio > 0.0f ? pixelRatio : 1.0f; }
+    float coordinateScale() const {
+        // Tọa độ từ OH_ArkUI_PointerEvent_GetXByIndex là đơn vị vp (virtual pixels).
+        // Trên Huawei Watch 5 (466x466), màn hình rộng 233vp (density = 2.0).
+        // Mức độ nhạy 2.0x (gấp 2 lần so với mức 1.0x ban đầu) tương ứng chính xác tỷ lệ
+        // 1 vp = 2 physical pixels: bản đồ bám dính hoàn hảo 1:1 theo đầu ngón tay,
+        // không bị trễ hay trôi tuột, không bị phóng quá đà.
+        constexpr float baseDensityScale = 2.0f;
+        constexpr float panSensitivity = 1.0f;
+        return baseDensityScale * panSensitivity; // = 2.0f (chuẩn 2 lần so với mức 1.0 gốc)
+    }
 
     mbgl::ohos::TouchPoint touchPointAt(const ArkUI_UIInputEvent* event, std::uint32_t pointerIndex) const {
         const auto scale = coordinateScale();
@@ -804,7 +945,6 @@ private:
 
         auto& currentMapView = ensureMapView();
         if (window == nullptr || width == 0 || height == 0) {
-            clearSurface();
             return;
         }
 
@@ -815,8 +955,9 @@ private:
                 appliedStyleGeneration = 0;
             }
             applyDesiredStyle();
-            renderFrame();
             lastSurfaceError.clear();
+            armRenderPump();
+            renderFrame();
         } catch (const std::exception& exception) {
             lastSurfaceError = exception.what();
             clearSurface();
@@ -824,9 +965,68 @@ private:
         }
     }
 
+    bool isInteractive() const {
+        if (mbgl::ohos::hasActiveGesture(gesture) || (mapView && mapView->isInteractive())) {
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (lastTouchTime.time_since_epoch().count() != 0 &&
+            now - lastTouchTime <
+                std::chrono::milliseconds(mbgl::ohos::WatchRenderPolicy::gpuInteractiveHoldMilliseconds)) {
+            return true;
+        }
+        if (lastCameraJumpTime.time_since_epoch().count() != 0 &&
+            now - lastCameraJumpTime < std::chrono::milliseconds(2000)) {
+            return true;
+        }
+        return false;
+    }
+
+    void armRenderPump() {
+        if (closed || !renderingEnabled || window == nullptr || width == 0 || height == 0) {
+            disarmRenderPump();
+            return;
+        }
+
+        const bool interactive = isInteractive();
+        if (renderPumpArmed && renderPumpInteractive == interactive) {
+            return;
+        }
+
+        // Backup pump. Never run 16–32ms while idle: a full GL frame is ~30ms
+        // on this watch and that rate trips APP_INPUT_BLOCK. Interactive pan
+        // and camera animations need ~30fps or fling looks like a jump.
+        renderPumpArmed = true;
+        const bool becameInteractive = interactive && !renderPumpInteractive;
+        renderPumpInteractive = interactive;
+        vsyncWatchdog.stop();
+        vsyncFallbackTimer.stop();
+        // uv timers only fire when the MapLibre loop is pumped, and a 0ms first
+        // timeout re-enters uv_run from this callback (stack overflow). Drag is
+        // painted from MOVE; fling uses the JS-thread TSFN 33ms clock.
+        setInteractiveWake(interactive);
+        if (!interactive) {
+            const auto idle = mbgl::Milliseconds(mbgl::ohos::WatchRenderPolicy::gpuIdleMilliseconds);
+            vsyncFallbackTimer.start(idle, idle, [this] { renderFrameThrottled(); });
+        }
+        if (becameInteractive) {
+            maxGpuMs = 0.0;
+            hitchCount = 0;
+        }
+    }
+
+    void disarmRenderPump() {
+        renderPumpArmed = false;
+        renderPumpInteractive = false;
+        setInteractiveWake(false);
+        vsyncWatchdog.stop();
+        vsyncFallbackTimer.stop();
+    }
+
     mbgl::ohos::MapView& ensureMapView() {
         if (!mapView) {
             mapView = std::make_unique<mbgl::ohos::MapView>(pixelRatio);
+            mapView->setRepaintCallback([this] { renderFrameThrottled(); });
         }
         return *mapView;
     }
@@ -877,6 +1077,19 @@ private:
     bool closed = false;
     std::uint64_t frameCallbackCount = 0;
     bool surfaceVisible = false;
+    bool inRenderFrame = false;
+    mbgl::util::Timer vsyncFallbackTimer;
+    mbgl::util::Timer vsyncWatchdog;
+    bool renderPumpArmed = false;
+    bool renderPumpInteractive = false;
+    bool inThrottledRender = false;
+    std::chrono::steady_clock::time_point lastTouchTime{};
+    std::chrono::steady_clock::time_point lastCameraJumpTime{};
+    double lastGpuMs = 0.0;
+    double maxGpuMs = 0.0;
+    std::uint64_t hitchCount = 0;
+    std::uint64_t frameCountWhenWatchdogArmed = 0;
+    std::chrono::steady_clock::time_point lastGpuRender{};
     std::string lastSurfaceError;
     mbgl::ohos::GestureState gesture;
     std::optional<OH_NativeXComponent_ExpectedRateRange> frameRateRange;
@@ -887,6 +1100,105 @@ private:
     double frameCallbackRate = 0.0;
 };
 
+napi_threadsafe_function g_renderTsfn = nullptr;
+std::atomic<bool> g_interactiveWakeWanted{false};
+std::atomic<bool> g_interactiveWakeAlive{false};
+
+void setInteractiveWake(bool wanted) {
+    g_interactiveWakeWanted.store(wanted);
+    if (!wanted) {
+        return;
+    }
+    bool expected = false;
+    if (!g_interactiveWakeAlive.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    if (g_renderTsfn) {
+        napi_acquire_threadsafe_function(g_renderTsfn);
+    }
+    std::thread([] {
+        // ArkTS DisplaySync điều khiển VSync 60Hz trực tiếp trên UI thread.
+        // Thread này chỉ đóng vai trò watchdog thưa (100ms) để giữ quán tính animation,
+        // tránh bắn TSFN 16ms liên tục gây nghẽn ArkUI event queue.
+        const auto interval = std::chrono::milliseconds(100);
+        while (g_interactiveWakeWanted.load()) {
+            std::this_thread::sleep_for(interval);
+            if (!g_interactiveWakeWanted.load()) {
+                break;
+            }
+            if (g_renderTsfn) {
+                napi_call_threadsafe_function(g_renderTsfn, nullptr, napi_tsfn_nonblocking);
+            }
+        }
+        if (g_renderTsfn) {
+            napi_release_threadsafe_function(g_renderTsfn, napi_tsfn_release);
+        }
+        g_interactiveWakeAlive.store(false);
+    }).detach();
+}
+
+void forEachLiveController(const std::function<void(SurfaceController&)>& fn) {
+    std::vector<std::shared_ptr<SurfaceController>> live;
+    {
+        std::lock_guard<std::mutex> lock(controllerRegistryMutex());
+        for (const auto& entry : controllersByNode()) {
+            if (auto controller = entry.second.lock()) {
+                live.push_back(std::move(controller));
+            }
+        }
+    }
+    for (auto& controller : live) {
+        fn(*controller);
+    }
+}
+
+void ensureMapLibreRunLoop() {
+    static mbgl::util::RunLoop loop;
+    static mbgl::util::AsyncTask wakeRender([] {
+        forEachLiveController([](SurfaceController& controller) { controller.renderFrameThrottled(); });
+    });
+    static bool hooked = false;
+    if (!hooked) {
+        hooked = true;
+        loop.setPlatformCallback([] { wakeRender.send(); });
+    }
+}
+
+napi_value emptyRenderPumpJs(napi_env env, napi_callback_info /*info*/) {
+    return getUndefined(env);
+}
+
+void callJsRenderPump(napi_env env, napi_value /*jsCallback*/, void* /*context*/, void* /*data*/) {
+    if (!env) {
+        return;
+    }
+    forEachLiveController([](SurfaceController& controller) { controller.renderFrameThrottled(); });
+}
+
+void ensureRenderPumpTsfn(napi_env env) {
+    if (g_renderTsfn) {
+        return;
+    }
+    napi_value asyncName = nullptr;
+    napi_create_string_utf8(env, "MapLibreRenderPump", NAPI_AUTO_LENGTH, &asyncName);
+    napi_value jsFn = nullptr;
+    napi_create_function(env, "mapLibreRenderPump", NAPI_AUTO_LENGTH, emptyRenderPumpJs, nullptr, &jsFn);
+    if (napi_create_threadsafe_function(env,
+                                        jsFn,
+                                        nullptr,
+                                        asyncName,
+                                        0,
+                                        1,
+                                        nullptr,
+                                        nullptr,
+                                        nullptr,
+                                        callJsRenderPump,
+                                        &g_renderTsfn) != napi_ok) {
+        g_renderTsfn = nullptr;
+        mbgl::Log::Warning(mbgl::Event::Setup, "Could not create interactive render pump TSFN");
+    }
+}
+
 using ControllerHandle = std::shared_ptr<SurfaceController>;
 
 napi_value destroy(napi_env env, napi_callback_info info);
@@ -894,6 +1206,7 @@ napi_value renderFrame(napi_env env, napi_callback_info info);
 napi_value reduceMemoryUse(napi_env env, napi_callback_info info);
 napi_value setStyleUrl(napi_env env, napi_callback_info info);
 napi_value jumpTo(napi_env env, napi_callback_info info);
+napi_value zoomBy(napi_env env, napi_callback_info info);
 napi_value setPixelRatio(napi_env env, napi_callback_info info);
 napi_value setBounds(napi_env env, napi_callback_info info);
 napi_value setRenderingEnabled(napi_env env, napi_callback_info info);
@@ -905,6 +1218,7 @@ napi_value getPixelRatio(napi_env env, napi_callback_info info);
 napi_value getStyleAttributions(napi_env env, napi_callback_info info);
 napi_value getSurfaceState(napi_env env, napi_callback_info info);
 napi_value getCameraOptions(napi_env env, napi_callback_info info);
+napi_value isInteractive(napi_env env, napi_callback_info info);
 
 ControllerHandle resolveController(napi_env env, napi_value thisArg) {
     void* nativeController = nullptr;
@@ -939,7 +1253,9 @@ const napi_property_descriptor* contextProperties(std::size_t& count) {
         {"getPixelRatio", nullptr, getPixelRatio, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getStyleAttributions", nullptr, getStyleAttributions, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getSurfaceState", nullptr, getSurfaceState, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"isInteractive", nullptr, isInteractive, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"jumpTo", nullptr, jumpTo, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"zoomBy", nullptr, zoomBy, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"reduceMemoryUse", nullptr, reduceMemoryUse, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"renderFrame", nullptr, renderFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setBounds", nullptr, setBounds, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -994,6 +1310,7 @@ napi_value createMap(napi_env env, napi_callback_info info) {
     }
 
     try {
+        ensureMapLibreRunLoop();
         return createContextObject(env, createController(content));
     } catch (const std::exception& exception) {
         return throwError(env, exception.what());
@@ -1081,6 +1398,32 @@ napi_value jumpTo(napi_env env, napi_callback_info info) {
 
     try {
         controller->jumpTo(std::move(cameraOptions));
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+    return getUndefined(env);
+}
+
+napi_value zoomBy(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected a zoom delta");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    double deltaZoom = 0.0;
+    if (!getDouble(env, argv[0], deltaZoom) || !std::isfinite(deltaZoom)) {
+        return throwError(env, "Expected a finite zoom delta");
+    }
+
+    try {
+        controller->zoomBy(deltaZoom);
     } catch (const std::exception& exception) {
         return throwError(env, exception.what());
     }
@@ -1335,15 +1678,274 @@ napi_value getCameraOptions(napi_env env, napi_callback_info info) {
     return createCameraOptionsObject(env, controller->getCameraOptions());
 }
 
+napi_value isInteractive(napi_env env, napi_callback_info info) {
+    std::size_t argc = 0;
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, nullptr, &thisArg, nullptr) != napi_ok) {
+        return throwError(env, "Expected a MapLibre XComponent context");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    napi_value result = nullptr;
+    napi_get_boolean(env, controller->interactiveNow(), &result);
+    return result;
+}
+
+static napi_threadsafe_function g_httpTsfn = nullptr;
+static napi_threadsafe_function g_httpCancelTsfn = nullptr;
+
+static void CallJsHttpBridge(napi_env env, napi_value js_callback, void* context, void* data) {
+    (void)context;
+    if (!env || !js_callback || !data) {
+        return;
+    }
+    auto* req = static_cast<mbgl::ohos::HttpBridgeRequest*>(data);
+
+    napi_value reqIdVal = nullptr;
+    napi_create_int64(env, static_cast<int64_t>(req->id), &reqIdVal);
+
+    napi_value urlVal = nullptr;
+    napi_create_string_utf8(env, req->url.c_str(), req->url.length(), &urlVal);
+
+    napi_value headersVal = nullptr;
+    napi_create_object(env, &headersVal);
+    for (const auto& kv : req->headers) {
+        napi_value val = nullptr;
+        napi_create_string_utf8(env, kv.second.c_str(), kv.second.length(), &val);
+        napi_set_named_property(env, headersVal, kv.first.c_str(), val);
+    }
+
+    napi_value args[3] = {reqIdVal, urlVal, headersVal};
+    napi_value global = nullptr;
+    napi_get_global(env, &global);
+    napi_value result = nullptr;
+    napi_call_function(env, global, js_callback, 3, args, &result);
+
+    delete req;
+}
+
+static void CallJsHttpCancel(napi_env env, napi_value js_callback, void* context, void* data) {
+    (void)context;
+    if (!env || !js_callback || !data) {
+        return;
+    }
+    auto* reqId = static_cast<uint64_t*>(data);
+
+    napi_value reqIdVal = nullptr;
+    napi_create_int64(env, static_cast<int64_t>(*reqId), &reqIdVal);
+
+    napi_value args[1] = {reqIdVal};
+    napi_value global = nullptr;
+    napi_get_global(env, &global);
+    napi_value result = nullptr;
+    napi_call_function(env, global, js_callback, 1, args, &result);
+
+    delete reqId;
+}
+
+napi_value registerHttpBridge(napi_env env, napi_callback_info info) {
+    std::size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok || argc < 1 || !args[0]) {
+        return throwError(env, "Expected a callback function for registerHttpBridge");
+    }
+
+    napi_value asyncResourceName = nullptr;
+    napi_create_string_utf8(env, "MapLibreHttpBridge", NAPI_AUTO_LENGTH, &asyncResourceName);
+
+    if (g_httpTsfn) {
+        napi_release_threadsafe_function(g_httpTsfn, napi_tsfn_release);
+        g_httpTsfn = nullptr;
+    }
+    if (g_httpCancelTsfn) {
+        napi_release_threadsafe_function(g_httpCancelTsfn, napi_tsfn_release);
+        g_httpCancelTsfn = nullptr;
+    }
+
+    napi_status status = napi_create_threadsafe_function(
+        env,
+        args[0],
+        nullptr,
+        asyncResourceName,
+        0,
+        1,
+        nullptr,
+        nullptr,
+        nullptr,
+        CallJsHttpBridge,
+        &g_httpTsfn);
+
+    if (status != napi_ok) {
+        return throwError(env, "Failed to create threadsafe function for HttpBridge");
+    }
+
+    // Optional second callback: notified when native no longer needs a
+    // request (tile out-of-viewport, map destroy). ArkTS side drops it from
+    // the queue / aborts it to save radio bandwidth on slow links.
+    if (argc >= 2 && args[1] != nullptr) {
+        napi_valuetype argType = napi_undefined;
+        if (napi_typeof(env, args[1], &argType) == napi_ok && argType == napi_function) {
+            napi_value cancelResourceName = nullptr;
+            napi_create_string_utf8(env, "MapLibreHttpBridgeCancel", NAPI_AUTO_LENGTH, &cancelResourceName);
+            napi_status cancelStatus = napi_create_threadsafe_function(
+                env,
+                args[1],
+                nullptr,
+                cancelResourceName,
+                0,
+                1,
+                nullptr,
+                nullptr,
+                nullptr,
+                CallJsHttpCancel,
+                &g_httpCancelTsfn);
+            if (cancelStatus != napi_ok) {
+                g_httpCancelTsfn = nullptr;
+            }
+        }
+    }
+
+    mbgl::ohos::setHttpBridge(
+        [](const mbgl::ohos::HttpBridgeRequest& req) {
+            if (g_httpTsfn) {
+                auto* copy = new mbgl::ohos::HttpBridgeRequest(req);
+                napi_call_threadsafe_function(g_httpTsfn, copy, napi_tsfn_nonblocking);
+            }
+        },
+        [](uint64_t id) {
+            if (g_httpCancelTsfn) {
+                auto* copy = new uint64_t(id);
+                napi_call_threadsafe_function(g_httpCancelTsfn, copy, napi_tsfn_nonblocking);
+            }
+        });
+
+    return getUndefined(env);
+}
+
+napi_value onHttpResponse(napi_env env, napi_callback_info info) {
+    std::size_t argc = 5;
+    napi_value args[5] = {nullptr};
+    if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok || argc < 5) {
+        return throwError(env, "Expected 5 arguments for onHttpResponse: reqId, statusCode, data, headers, error");
+    }
+
+    int64_t reqId = 0;
+    napi_get_value_int64(env, args[0], &reqId);
+
+    int32_t statusCode = 0;
+    napi_get_value_int32(env, args[1], &statusCode);
+
+    void* dataPtr = nullptr;
+    size_t byteLength = 0;
+    bool isArrayBuffer = false;
+    napi_is_arraybuffer(env, args[2], &isArrayBuffer);
+    if (isArrayBuffer) {
+        napi_get_arraybuffer_info(env, args[2], &dataPtr, &byteLength);
+    }
+
+    std::map<std::string, std::string> headersMap;
+    if (isObject(env, args[3])) {
+        napi_value propNames = nullptr;
+        if (napi_get_property_names(env, args[3], &propNames) == napi_ok) {
+            uint32_t length = 0;
+            napi_get_array_length(env, propNames, &length);
+            for (uint32_t i = 0; i < length; ++i) {
+                napi_value keyVal = nullptr;
+                napi_get_element(env, propNames, i, &keyVal);
+                char keyBuf[256] = {0};
+                size_t keyLen = 0;
+                napi_get_value_string_utf8(env, keyVal, keyBuf, sizeof(keyBuf) - 1, &keyLen);
+
+                napi_value propVal = nullptr;
+                napi_get_property(env, args[3], keyVal, &propVal);
+                char valBuf[1024] = {0};
+                size_t valLen = 0;
+                napi_get_value_string_utf8(env, propVal, valBuf, sizeof(valBuf) - 1, &valLen);
+
+                headersMap[std::string(keyBuf, keyLen)] = std::string(valBuf, valLen);
+            }
+        }
+    }
+
+    char errBuf[512] = {0};
+    size_t errLen = 0;
+    napi_get_value_string_utf8(env, args[4], errBuf, sizeof(errBuf) - 1, &errLen);
+    std::string errorStr(errBuf, errLen);
+
+    mbgl::ohos::dispatchHttpResponse(
+        static_cast<uint64_t>(reqId),
+        statusCode,
+        static_cast<const char*>(dataPtr),
+        byteLength,
+        headersMap,
+        errorStr);
+
+    // During pan the 33ms TSFN already paints. GPU-on-HTTP on the JS thread
+    // is a hitch: tile parse/upload lands in the middle of a Move stream.
+    forEachLiveController([](SurfaceController& controller) {
+        if (controller.interactiveNow()) {
+            controller.pumpEvents();
+        } else {
+            controller.renderFrameThrottled();
+        }
+    });
+
+    return getUndefined(env);
+}
+
 napi_value Init(napi_env env, napi_value exports) {
+    ensureMapLibreRunLoop();
+    ensureRenderPumpTsfn(env);
+    mbgl::Log::Info(mbgl::Event::Setup, "VietMapGL native init: RunLoop + DisplaySync 60Hz + 100ms watchdog / 250ms idle pump");
     napi_property_descriptor properties[] = {
         {"createMap", nullptr, createMap, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"registerHttpBridge", nullptr, registerHttpBridge, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"onHttpResponse", nullptr, onHttpResponse, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
 
     napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties);
+    napi_set_named_property(env, exports, "default", exports);
     return exports;
 }
 
 } // namespace
 
-NAPI_MODULE(maplibre_native_ohos, Init)
+static napi_module _module_maplibre = {
+    .nm_version = 1,
+    .nm_flags = 0,
+    .nm_filename = nullptr,
+    .nm_register_func = Init,
+    .nm_modname = "maplibre_native_ohos",
+    .nm_priv = ((void*)0),
+    .reserved = { 0 },
+};
+
+static napi_module _module_entry = {
+    .nm_version = 1,
+    .nm_flags = 0,
+    .nm_filename = nullptr,
+    .nm_register_func = Init,
+    .nm_modname = "entry",
+    .nm_priv = ((void*)0),
+    .reserved = { 0 },
+};
+
+static napi_module _module_lib = {
+    .nm_version = 1,
+    .nm_flags = 0,
+    .nm_filename = nullptr,
+    .nm_register_func = Init,
+    .nm_modname = "libmaplibre_native_ohos",
+    .nm_priv = ((void*)0),
+    .reserved = { 0 },
+};
+
+extern "C" __attribute__((constructor)) void RegisterMapLibreNativeModules(void) {
+    napi_module_register(&_module_maplibre);
+    napi_module_register(&_module_entry);
+    napi_module_register(&_module_lib);
+}

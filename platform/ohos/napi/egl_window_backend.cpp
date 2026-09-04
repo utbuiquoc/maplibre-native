@@ -363,6 +363,12 @@ void EGLWindowBackend::activate() {
     if (!eglMakeCurrent(displayConfig->display, eglSurface, eglSurface, eglContext)) {
         throw std::runtime_error(eglErrorMessage("eglMakeCurrent"));
     }
+    // Default swap interval 1 can block ~16ms on the UI thread after every
+    // frame. Pan already updates the camera on the input path; don't add a
+    // vsync wait on top of a ~30ms GL frame.
+    if (!eglSwapInterval(displayConfig->display, 0)) {
+        Log::Warning(Event::OpenGL, eglErrorMessage("eglSwapInterval"));
+    }
     if (framebufferDiagnostic.empty()) {
         framebufferDiagnostic = formatDefaultFramebuffer();
         logDiagnostic(framebufferDiagnostic);

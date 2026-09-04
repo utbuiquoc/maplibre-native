@@ -581,7 +581,11 @@ double Map::getTileLodPitchThreshold() const {
 }
 
 void Map::setTileLodZoomShift(double shift) {
+    if (impl->tileLodZoomShift == shift) {
+        return;
+    }
     impl->tileLodZoomShift = shift;
+    impl->onUpdate();
 }
 
 double Map::getTileLodZoomShift() const {

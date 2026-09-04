@@ -485,8 +485,13 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
     if (isMapModeContinuous) {
         MLN_TRACE_ZONE(placement);
 
+        // Wheel/pinch zoom sets gestureInProgress so labels scale with the camera
+        // instead of running collision placement on every zoom step.
+        // VietMapGL wearable: hoãn placement khi gesture để đạt 60fps mượt mà khi vuốt chạm.
+        const bool deferPlacement = updateParameters->transformState.isGestureInProgress();
+
         std::optional<Duration> placementUpdatePeriodOverride;
-        if (symbolBucketsAdded && !tiltedView) {
+        if (!deferPlacement && symbolBucketsAdded && !tiltedView) {
             // If the view is not tilted, we want *the new* symbols to show up
             // faster, however simple setting `placementChanged` to `true` would
             // initiate placement too often as new buckets usually come from
@@ -499,10 +504,11 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
             placementUpdatePeriodOverride = std::optional<Duration>(Milliseconds(30));
         }
 
-        renderTreeParameters->placementChanged = !placementController.placementIsRecent(
-            updateParameters->timePoint,
-            static_cast<float>(updateParameters->transformState.getZoom()),
-            placementUpdatePeriodOverride);
+        renderTreeParameters->placementChanged = !deferPlacement &&
+                                                 !placementController.placementIsRecent(
+                                                     updateParameters->timePoint,
+                                                     static_cast<float>(updateParameters->transformState.getZoom()),
+                                                     placementUpdatePeriodOverride);
         symbolBucketsChanged |= renderTreeParameters->placementChanged;
         if (renderTreeParameters->placementChanged) {
             Mutable<Placement> placement = Placement::create(updateParameters, placementController.getPlacement());

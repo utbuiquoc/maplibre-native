@@ -10,6 +10,10 @@ Public OpenHarmony platform documentation is available in the
 See [the sample readme](./sample/README.md) to build and run the NAPI/XComponent
 integration example in DevEco Studio.
 
+NAPI/XComponent glue (`map_view`, `native_module`, `watch_render_policy`, backends)
+lives in `platform/ohos/napi`. The wearable app and the sample both
+`add_subdirectory` that folder so there is a single C++ source tree.
+
 ## CMake Build
 
 When invoking CMake directly from this repository root, set the native SDK paths

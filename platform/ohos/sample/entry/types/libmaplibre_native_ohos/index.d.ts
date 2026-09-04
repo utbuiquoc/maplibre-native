@@ -65,11 +65,15 @@ export interface SurfaceState {
   hasSurface: boolean;
   hasMap: boolean;
   needsRender: boolean;
+  interactive: boolean;
   styleLoaded: boolean;
   mapLoaded: boolean;
   fullyLoaded: boolean;
   renderedFrameRate: number;
   frameCallbackRate: number;
+  lastGpuMs: number;
+  maxGpuMs: number;
+  hitchCount: number;
   backend?: string;
   surfaceVisible: boolean;
   lastSurfaceError?: string;
@@ -87,6 +91,7 @@ export interface XComponentContext {
   getStyleAttributions: () => string[];
   getSurfaceState: () => SurfaceState;
   jumpTo: (options: CameraOptions) => void;
+  zoomBy: (deltaZoom: number) => void;
   reduceMemoryUse: () => void;
   renderFrame: () => void;
   setBounds: (options: BoundOptions) => void;
