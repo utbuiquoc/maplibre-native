@@ -56,6 +56,8 @@ public:
     void prepareInteractionZoom(double nextZoom);
     void endInteractionZoom();
     void moveBy(double x, double y, AnimationOptions = {});
+    void accumulatePan(double x, double y);
+    void flushPendingPan();
     void pitchBy(double deltaPitch);
     void scaleBy(double scale, double anchorX, double anchorY);
     void flyBy(double scale, double anchorX, double anchorY, AnimationOptions = {});
@@ -84,6 +86,11 @@ public:
     std::vector<std::string> getStyleAttributions() const;
     bool hasPendingRender() const;
     std::uint64_t getRenderedFrameCount() const { return renderedFrameCount; }
+    double getLastPumpMs() const { return lastPumpMs; }
+    double getLastGlMs() const { return lastGlMs; }
+    double getLastGlCpuMs() const { return lastGlCpuMs; }
+    double getLastGpuWaitMs() const { return lastGpuWaitMs; }
+    bool getLastGpuWaitSampled() const { return lastGpuWaitSampled; }
     bool hasLoadedStyle() const { return styleLoaded; }
     bool hasLoadedMap() const { return mapLoaded; }
     bool isFullyLoaded() const;
@@ -157,6 +164,14 @@ private:
     ResourceOptions resourceOptions;
     ZoomSession zoomSession;
     bool touchGestureActive = false;
+    double pendingPanX = 0.0;
+    double pendingPanY = 0.0;
+    bool hasPendingPan = false;
+    double lastPumpMs = 0.0;
+    double lastGlMs = 0.0;
+    double lastGlCpuMs = 0.0;
+    double lastGpuWaitMs = 0.0;
+    bool lastGpuWaitSampled = false;
     std::function<void()> repaintCallback;
     std::unique_ptr<util::AsyncTask> asyncInvalidate;
 };

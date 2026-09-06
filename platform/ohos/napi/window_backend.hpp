@@ -18,6 +18,9 @@ public:
 
     virtual std::int32_t getGlesContextClientVersion() const { return 0; }
     virtual const std::string& getRendererDiagnostic() const { return emptyDiagnostic(); }
+    // PERF sampling (measure-only): GPU drain of sampled presented frames.
+    virtual double getLastGpuWaitMs() const { return 0.0; }
+    virtual bool consumeGpuWaitSampled() { return false; }
 
 private:
     static const std::string& emptyDiagnostic() {

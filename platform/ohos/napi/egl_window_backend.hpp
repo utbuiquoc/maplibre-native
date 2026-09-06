@@ -30,6 +30,13 @@ public:
     std::int32_t getGlesContextClientVersion() const override { return contextClientVersion; }
     void setSize(Size) override;
     void swap();
+    // PERF sampling (measure-only): GPU drain of every 30th presented frame.
+    double getLastGpuWaitMs() const override { return lastGpuWaitMs; }
+    bool consumeGpuWaitSampled() override {
+        const bool sampled = gpuWaitSampled;
+        gpuWaitSampled = false;
+        return sampled;
+    }
 
 protected:
     void activate() override;
@@ -47,6 +54,9 @@ private:
     OHNativeWindow* window = nullptr;
     std::int32_t contextClientVersion = 0;
     std::string framebufferDiagnostic;
+    std::uint64_t swapCount = 0;
+    double lastGpuWaitMs = 0.0;
+    bool gpuWaitSampled = false;
 };
 
 } // namespace ohos

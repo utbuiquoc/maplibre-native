@@ -13,6 +13,7 @@
 #include <native_buffer/native_buffer.h>
 
 #include <array>
+#include <chrono>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -352,6 +353,17 @@ void EGLWindowBackend::setSize(Size size_) {
 void EGLWindowBackend::swap() {
     MLN_TRACE_FUNC();
 
+    // PERF sampling (measure-only, reversible): 1/30 frames, drain the GPU
+    // queue BEFORE the non-blocking swap and time it. This is the only number
+    // that contains true GPU fill time; plain frame timing is submit-only.
+    ++swapCount;
+    if ((swapCount % 30) == 0) {
+        const auto waitStart = std::chrono::steady_clock::now();
+        platform::glFinish();
+        lastGpuWaitMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+        gpuWaitSampled = true;
+    }
     if (!eglSwapBuffers(displayConfig->display, eglSurface)) {
         Log::Warning(Event::OpenGL, eglErrorMessage("eglSwapBuffers"));
     }

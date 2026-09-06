@@ -108,32 +108,52 @@ void MapView::onInvalidate() {
 }
 
 void MapView::pumpEvents() {
+    const auto start = std::chrono::steady_clock::now();
     tickZoomSession();
     runLoopOnce();
+    // Apply coalesced touch pan once per tick: a 120Hz digitizer delivers
+    // ~2 Moves per 60Hz frame; one moveBy per tick halves onUpdate churn.
+    flushPendingPan();
     // Fling / flyTo keep isPanning|isScaling after the finger is up. Re-assert
     // MapLibre's gesture flag so symbol placement stays deferred until idle.
     syncGestureFlag();
+    lastPumpMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 bool MapView::renderFrame() {
     pumpEvents();
 
     bool rendered = false;
+    double glMs = 0.0;
     auto renderIfNeeded = [&] {
         if (frontend && frontend->hasPendingRender()) {
+            const auto glStart = std::chrono::steady_clock::now();
             if (frontend->renderFrame()) {
                 ++renderedFrameCount;
                 rendered = true;
             }
+            glMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - glStart).count();
         }
     };
 
     renderIfNeeded();
     runLoopOnce();
-    // Second GPU pass is for draining HTTP during load. During pan it doubles
-    // a ~30–50ms GL frame on the UI thread and batches the next Moves.
+    // Second GPU pass is for draining HTTP during load. Skipped while
+    // interactive so pan/fling never pays two GL frames on the UI thread.
     if (!isInteractive()) {
         renderIfNeeded();
+    }
+    lastGlMs = glMs;
+    // Attribution correction: on glFinish-sampled frames the wall time above
+    // contains the full GPU drain (pipelined work included). Subtract it so the
+    // ring measures comparable CPU-side cost on every frame. Raw lastGlMs and
+    // hitch logic are untouched.
+    lastGpuWaitMs = 0.0;
+    lastGlCpuMs = glMs;
+    lastGpuWaitSampled = backend && backend->consumeGpuWaitSampled();
+    if (lastGpuWaitSampled) {
+        lastGpuWaitMs = backend->getLastGpuWaitMs();
+        lastGlCpuMs = std::max(0.0, glMs - lastGpuWaitMs);
     }
 
     return rendered;
@@ -308,6 +328,33 @@ void MapView::moveBy(double x, double y, AnimationOptions animationOptions) {
     desiredCamera = map->getCameraOptions();
 }
 
+void MapView::accumulatePan(double x, double y) {
+    if (!map || !std::isfinite(x) || !std::isfinite(y) || (x == 0.0 && y == 0.0)) {
+        return;
+    }
+    pendingPanX += x;
+    pendingPanY += y;
+    hasPendingPan = true;
+}
+
+void MapView::flushPendingPan() {
+    if (!hasPendingPan) {
+        return;
+    }
+    hasPendingPan = false;
+    const double dx = pendingPanX;
+    const double dy = pendingPanY;
+    pendingPanX = 0.0;
+    pendingPanY = 0.0;
+    if (!map || (dx == 0.0 && dy == 0.0)) {
+        return;
+    }
+    map->moveBy(logicalCoordinateForFramebufferCoordinate(dx, dy, pixelRatio), AnimationOptions{});
+    desiredCameraBounds.reset();
+    desiredFreeCamera.reset();
+    desiredCamera = map->getCameraOptions();
+}
+
 void MapView::pitchBy(double deltaPitch) {
     if (!map || !std::isfinite(deltaPitch)) {
         return;
@@ -456,8 +503,15 @@ void MapView::syncGestureFlag() {
     if (!map) {
         return;
     }
-    map->setGestureInProgress(touchGestureActive || zoomSession.active || map->isPanning() || map->isScaling() ||
-                              map->isRotating());
+    const bool want = touchGestureActive || zoomSession.active || map->isPanning() || map->isScaling() ||
+                      map->isRotating();
+    // Idempotency guard: Map::setGestureInProgress() calls onUpdate()
+    // unconditionally, which marks needsRender. Calling it on every pump
+    // self-dirties and defeats the hasPendingRender() early-out, forcing a
+    // full GL frame every tick even with the finger held still.
+    if (map->isGestureInProgress() != want) {
+        map->setGestureInProgress(want);
+    }
     applyTileLodShift(currentZoom());
 }
 
@@ -784,6 +838,14 @@ void MapView::resetRuntimeState() {
     styleLoaded = false;
     mapLoaded = false;
     renderedFrameCount = 0;
+    lastPumpMs = 0.0;
+    lastGlMs = 0.0;
+    lastGlCpuMs = 0.0;
+    lastGpuWaitMs = 0.0;
+    lastGpuWaitSampled = false;
+    pendingPanX = 0.0;
+    pendingPanY = 0.0;
+    hasPendingPan = false;
     lastMapLoadError.clear();
     lastRenderError.clear();
     lastStyleImageMissing.clear();

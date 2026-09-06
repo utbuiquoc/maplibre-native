@@ -13,6 +13,7 @@
 #include <mbgl/util/timer.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <chrono>
@@ -258,6 +259,40 @@ void setDoubleProperty(napi_env env, napi_value object, const char* name, double
     napi_set_named_property(env, object, name, property);
 }
 
+// PERF rings (measure-only): nearest-rank percentiles over recent frames.
+template <std::size_t N>
+void pushRingSample(std::array<double, N>& ring, std::size_t& index, std::size_t& count, double value) {
+    ring[index % N] = value;
+    ++index;
+    if (count < N) {
+        ++count;
+    }
+}
+
+template <std::size_t N>
+double ringPercentile(const std::array<double, N>& ring, std::size_t count, double q) {
+    const std::size_t n = count < N ? count : N;
+    if (n == 0) {
+        return 0.0;
+    }
+    std::vector<double> sorted(ring.begin(), ring.begin() + n);
+    std::size_t k = static_cast<std::size_t>(q * static_cast<double>(n));
+    if (k >= n) {
+        k = n - 1;
+    }
+    std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(k), sorted.end());
+    return sorted[k];
+}
+
+template <std::size_t N>
+double ringMax(const std::array<double, N>& ring, std::size_t count) {
+    const std::size_t n = count < N ? count : N;
+    if (n == 0) {
+        return 0.0;
+    }
+    return *std::max_element(ring.begin(), ring.begin() + n);
+}
+
 void setStringProperty(napi_env env, napi_value object, const char* name, const std::string& value) {
     napi_set_named_property(env, object, name, createStringValue(env, value));
 }
@@ -447,14 +482,23 @@ public:
         }
 
         lastTouchTime = std::chrono::steady_clock::now();
+        // PERF (measure-only): touch-dispatch cost per event (NAPI parse +
+        // accumulate + pump-arm). At 120Hz input this contends with renders
+        // for the same UI thread; watch max alongside frame stats.
+        const auto touchStart = std::chrono::steady_clock::now();
         const bool cameraChanged = mbgl::ohos::handleTouchEvent(gesture, mapView.get(), createTouchEvent(inputEvent));
         armRenderPump();
         (void)cameraChanged;
+        lastTouchMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - touchStart).count();
+        if (lastTouchMs > maxTouchMs) {
+            maxTouchMs = lastTouchMs;
+        }
     }
 
     void pumpEvents() {
         if (!closed && mapView) {
             mapView->pumpEvents();
+            lastPumpMs = mapView->getLastPumpMs();
         }
     }
 
@@ -473,17 +517,36 @@ public:
         inRenderFrame = true;
         try {
             const auto gpuStart = std::chrono::steady_clock::now();
+            lastGpuRender = gpuStart;
             mapView->renderFrame();
-            lastGpuRender = std::chrono::steady_clock::now();
-            const double gpuMs = std::chrono::duration<double, std::milli>(lastGpuRender - gpuStart).count();
+            const auto gpuEnd = std::chrono::steady_clock::now();
+            // Start-stamp (đúng ý đồ WatchRenderPolicy.hpp:25 "12ms ~ 83fps max"):
+            // gate tính từ render TRƯỚC, không phải từ khi render xong. End-stamp
+            // cũ cộng thêm 12ms sau 10-13ms render → chu kỳ 22-25ms → trần ~30fps
+            // (đo P0c: mọi scenario kẹt 17-31fps dù GL 9-13ms, GPU rảnh).
+            const double gpuMs = std::chrono::duration<double, std::milli>(gpuEnd - gpuStart).count();
+            // Split attribution: lastGpuMs keeps the wall total for compat,
+            // lastPumpMs/lastGlMs tell whether the cost is event churn or GL.
             lastGpuMs = gpuMs;
+            lastPumpMs = mapView->getLastPumpMs();
+            lastGlMs = mapView->getLastGlMs();
+            pushRingSample(glCpuRing, glCpuRingIndex, glCpuRingCount, mapView->getLastGlCpuMs());
+            if (mapView->getLastGpuWaitSampled()) {
+                pushRingSample(gpuWaitRing, gpuWaitRingIndex, gpuWaitRingCount, mapView->getLastGpuWaitMs());
+                ++gpuWaitSamples;
+            }
             if (gpuMs > maxGpuMs) {
                 maxGpuMs = gpuMs;
             }
-            if (gpuMs >= mbgl::ohos::WatchRenderPolicy::gpuHitchMilliseconds) {
+            if (lastGlMs > maxGlMs) {
+                maxGlMs = lastGlMs;
+            }
+            // Hitch on true GL cost, not pump churn.
+            if (lastGlMs >= mbgl::ohos::WatchRenderPolicy::gpuHitchMilliseconds) {
                 ++hitchCount;
                 mbgl::Log::Warning(mbgl::Event::Render,
-                                   "GPU hitch " + std::to_string(static_cast<int>(gpuMs)) + "ms interactive=" +
+                                   "GPU hitch " + std::to_string(static_cast<int>(lastGlMs)) + "ms pump=" +
+                                       std::to_string(static_cast<int>(lastPumpMs)) + "ms interactive=" +
                                        (isInteractive() ? "1" : "0"));
             }
         } catch (const std::exception& exception) {
@@ -498,25 +561,28 @@ public:
             return;
         }
         inThrottledRender = true;
-        pumpEvents();
-        // Never restart a 0-delay uv timer from inside this callback: nested
-        // uv_run would re-enter until SIGSEGV. Switch cadence only.
-        if (isInteractive() != renderPumpInteractive || !renderPumpArmed) {
-            armRenderPump();
+        // Exception-safe: pumpEvents/armRenderPump không được phép kẹt cờ vĩnh
+        // viễn (nếu không, throttled pump chết hẳn — review finding M2).
+        try {
+            pumpEvents();
+            // Never restart a 0-delay uv timer from inside this callback: nested
+            // uv_run would re-enter until SIGSEGV. Switch cadence only.
+            if (isInteractive() != renderPumpInteractive || !renderPumpArmed) {
+                armRenderPump();
+            }
+            if (mapView->hasPendingRender()) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto minInterval = std::chrono::milliseconds(
+                    isInteractive() ? mbgl::ohos::WatchRenderPolicy::gpuInteractiveMinIntervalMilliseconds
+                                    : mbgl::ohos::WatchRenderPolicy::gpuIdleMinIntervalMilliseconds);
+                if (lastGpuRender.time_since_epoch().count() == 0 || now - lastGpuRender >= minInterval) {
+                    renderFrame();
+                }
+            }
+        } catch (const std::exception& exception) {
+            mbgl::Log::Error(mbgl::Event::Render,
+                             std::string("renderFrameThrottled failed: ") + exception.what());
         }
-        if (!mapView->hasPendingRender()) {
-            inThrottledRender = false;
-            return;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        const auto minInterval = std::chrono::milliseconds(
-            isInteractive() ? mbgl::ohos::WatchRenderPolicy::gpuInteractiveMinIntervalMilliseconds
-                            : mbgl::ohos::WatchRenderPolicy::gpuIdleMinIntervalMilliseconds);
-        if (lastGpuRender.time_since_epoch().count() != 0 && now - lastGpuRender < minInterval) {
-            inThrottledRender = false;
-            return;
-        }
-        renderFrame();
         inThrottledRender = false;
     }
 
@@ -727,6 +793,18 @@ public:
         setDoubleProperty(env, object, "frameCallbackRate", frameCallbackRate);
         setDoubleProperty(env, object, "lastGpuMs", lastGpuMs);
         setDoubleProperty(env, object, "maxGpuMs", maxGpuMs);
+        setDoubleProperty(env, object, "lastPumpMs", lastPumpMs);
+        setDoubleProperty(env, object, "lastGlMs", lastGlMs);
+        setDoubleProperty(env, object, "maxGlMs", maxGlMs);
+        setDoubleProperty(env, object, "glP50", ringPercentile(glCpuRing, glCpuRingCount, 0.50));
+        setDoubleProperty(env, object, "glP95", ringPercentile(glCpuRing, glCpuRingCount, 0.95));
+        setDoubleProperty(env, object, "glP99", ringPercentile(glCpuRing, glCpuRingCount, 0.99));
+        setDoubleProperty(env, object, "gpuWaitLast", mapView ? mapView->getLastGpuWaitMs() : 0.0);
+        setDoubleProperty(env, object, "gpuWaitP50", ringPercentile(gpuWaitRing, gpuWaitRingCount, 0.50));
+        setDoubleProperty(env, object, "gpuWaitMax", ringMax(gpuWaitRing, gpuWaitRingCount));
+        setSizeProperty(env, object, "gpuWaitSamples", gpuWaitSamples);
+        setDoubleProperty(env, object, "touchMs", lastTouchMs);
+        setDoubleProperty(env, object, "touchMaxMs", maxTouchMs);
         setSizeProperty(env, object, "hitchCount", hitchCount);
         if (!backendLabel.empty()) {
             setStringProperty(env, object, "backend", backendLabel);
@@ -849,14 +927,9 @@ private:
     }
 
     float coordinateScale() const {
-        // Tọa độ từ OH_ArkUI_PointerEvent_GetXByIndex là đơn vị vp (virtual pixels).
-        // Trên Huawei Watch 5 (466x466), màn hình rộng 233vp (density = 2.0).
-        // Mức độ nhạy 2.0x (gấp 2 lần so với mức 1.0x ban đầu) tương ứng chính xác tỷ lệ
-        // 1 vp = 2 physical pixels: bản đồ bám dính hoàn hảo 1:1 theo đầu ngón tay,
-        // không bị trễ hay trôi tuột, không bị phóng quá đà.
         constexpr float baseDensityScale = 2.0f;
         constexpr float panSensitivity = 1.0f;
-        return baseDensityScale * panSensitivity; // = 2.0f (chuẩn 2 lần so với mức 1.0 gốc)
+        return baseDensityScale * panSensitivity; // = 2.0f
     }
 
     mbgl::ohos::TouchPoint touchPointAt(const ArkUI_UIInputEvent* event, std::uint32_t pointerIndex) const {
@@ -1003,7 +1076,8 @@ private:
         vsyncFallbackTimer.stop();
         // uv timers only fire when the MapLibre loop is pumped, and a 0ms first
         // timeout re-enters uv_run from this callback (stack overflow). Drag is
-        // painted from MOVE; fling uses the JS-thread TSFN 33ms clock.
+        // painted from MOVE via DisplaySync 60Hz; fling uses the 33ms JS-thread
+        // watchdog as backup while DisplaySync is stopped.
         setInteractiveWake(interactive);
         if (!interactive) {
             const auto idle = mbgl::Milliseconds(mbgl::ohos::WatchRenderPolicy::gpuIdleMilliseconds);
@@ -1011,7 +1085,14 @@ private:
         }
         if (becameInteractive) {
             maxGpuMs = 0.0;
+            maxGlMs = 0.0;
             hitchCount = 0;
+            maxTouchMs = 0.0;
+            glCpuRingIndex = 0;
+            glCpuRingCount = 0;
+            gpuWaitRingIndex = 0;
+            gpuWaitRingCount = 0;
+            gpuWaitSamples = 0;
         }
     }
 
@@ -1087,6 +1168,22 @@ private:
     std::chrono::steady_clock::time_point lastCameraJumpTime{};
     double lastGpuMs = 0.0;
     double maxGpuMs = 0.0;
+    double lastPumpMs = 0.0;
+    double lastGlMs = 0.0;
+    double maxGlMs = 0.0;
+    double lastTouchMs = 0.0;
+    double maxTouchMs = 0.0;
+    // PERF rings (measure-only): gl CPU-side samples every frame (300),
+    // GPU-drain samples every 30th frame (120).
+    static constexpr std::size_t kGlCpuRingSize = 300;
+    static constexpr std::size_t kGpuWaitRingSize = 120;
+    std::array<double, kGlCpuRingSize> glCpuRing{};
+    std::size_t glCpuRingIndex = 0;
+    std::size_t glCpuRingCount = 0;
+    std::array<double, kGpuWaitRingSize> gpuWaitRing{};
+    std::size_t gpuWaitRingIndex = 0;
+    std::size_t gpuWaitRingCount = 0;
+    std::uint64_t gpuWaitSamples = 0;
     std::uint64_t hitchCount = 0;
     std::uint64_t frameCountWhenWatchdogArmed = 0;
     std::chrono::steady_clock::time_point lastGpuRender{};
@@ -1116,25 +1213,48 @@ void setInteractiveWake(bool wanted) {
     if (g_renderTsfn) {
         napi_acquire_threadsafe_function(g_renderTsfn);
     }
-    std::thread([] {
-        // ArkTS DisplaySync điều khiển VSync 60Hz trực tiếp trên UI thread.
-        // Thread này chỉ đóng vai trò watchdog thưa (100ms) để giữ quán tính animation,
-        // tránh bắn TSFN 16ms liên tục gây nghẽn ArkUI event queue.
-        const auto interval = std::chrono::milliseconds(100);
-        while (g_interactiveWakeWanted.load()) {
-            std::this_thread::sleep_for(interval);
-            if (!g_interactiveWakeWanted.load()) {
-                break;
+    try {
+        std::thread([] {
+        // Tick 8ms + gate 16ms (P2 pacing): trần ~62fps khớp panel 60Hz; tick
+        // rỗng early-out ~0ms. Idle vẫn dùng fallback thưa 250ms.
+        const auto interval = std::chrono::milliseconds(8);
+            for (;;) {
+                while (g_interactiveWakeWanted.load()) {
+                    std::this_thread::sleep_for(interval);
+                    if (!g_interactiveWakeWanted.load()) {
+                        break;
+                    }
+                    if (g_renderTsfn) {
+                        napi_call_threadsafe_function(g_renderTsfn, nullptr, napi_tsfn_nonblocking);
+                    }
+                }
+                // Lost-wake race: re-arm có thể rơi đúng lúc thread đang thoát
+                // (wanted=true, alive vừa false, không còn thread nào). Store
+                // alive=false TRƯỚC rồi re-check; nếu re-arm xảy ra sau khi ta
+                // store nhưng CAS của caller đã fail → ta tự nhận lại nhiệm vụ.
+                g_interactiveWakeAlive.store(false);
+                if (!g_interactiveWakeWanted.load()) {
+                    break;
+                }
+                bool rearmExpected = false;
+                if (!g_interactiveWakeAlive.compare_exchange_strong(rearmExpected, true)) {
+                    break;  // caller khác đã spawn thread mới và giữ alive=true
+                }
             }
             if (g_renderTsfn) {
-                napi_call_threadsafe_function(g_renderTsfn, nullptr, napi_tsfn_nonblocking);
+                napi_release_threadsafe_function(g_renderTsfn, napi_tsfn_release);
             }
-        }
+        }).detach();
+    } catch (const std::exception& exception) {
+        // std::thread ctor throw (hết resource): phải trả alive=false + release
+        // ref vừa acquire, nếu không wake chết vĩnh viễn + leak TSFN ref.
+        mbgl::Log::Error(mbgl::Event::Render,
+                         std::string("Could not spawn render wake thread: ") + exception.what());
+        g_interactiveWakeAlive.store(false);
         if (g_renderTsfn) {
             napi_release_threadsafe_function(g_renderTsfn, napi_tsfn_release);
         }
-        g_interactiveWakeAlive.store(false);
-    }).detach();
+    }
 }
 
 void forEachLiveController(const std::function<void(SurfaceController&)>& fn) {
@@ -1338,7 +1458,11 @@ napi_value renderFrame(napi_env env, napi_callback_info info) {
     }
 
     if (auto controller = resolveController(env, thisArg)) {
-        controller->renderFrame();
+        // P2: mọi đường render (poll 1s, displaySync pump lúc load, resume...)
+        // đều qua gate — displaySync 40Hz × frame spike 100ms từng bão hòa
+        // thread JS lúc load (140% duty). Gate 16ms giữ trần ~62fps.
+        // runLoopOnce vẫn chạy mỗi call (pump HTTP/tile không phụ thuộc render).
+        controller->renderFrameThrottled();
     }
     return getUndefined(env);
 }
@@ -1884,8 +2008,9 @@ napi_value onHttpResponse(napi_env env, napi_callback_info info) {
         headersMap,
         errorStr);
 
-    // During pan the 33ms TSFN already paints. GPU-on-HTTP on the JS thread
-    // is a hitch: tile parse/upload lands in the middle of a Move stream.
+    // During pan DisplaySync 60Hz (plus the 33ms watchdog backup) already
+    // paints. GPU-on-HTTP on the JS thread is a hitch: tile parse/upload
+    // lands in the middle of a Move stream.
     forEachLiveController([](SurfaceController& controller) {
         if (controller.interactiveNow()) {
             controller.pumpEvents();
@@ -1900,7 +2025,7 @@ napi_value onHttpResponse(napi_env env, napi_callback_info info) {
 napi_value Init(napi_env env, napi_value exports) {
     ensureMapLibreRunLoop();
     ensureRenderPumpTsfn(env);
-    mbgl::Log::Info(mbgl::Event::Setup, "VietMapGL native init: RunLoop + DisplaySync 60Hz + 100ms watchdog / 250ms idle pump");
+    mbgl::Log::Info(mbgl::Event::Setup, "VietMapGL native init: RunLoop + DisplaySync 60Hz + 16ms interactive watchdog / 250ms idle pump");
     napi_property_descriptor properties[] = {
         {"createMap", nullptr, createMap, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"registerHttpBridge", nullptr, registerHttpBridge, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -22,8 +22,11 @@ struct WatchRenderPolicy {
     // GPU interactive cadence: 16ms target (~60fps) cho trải nghiệm vuốt chạm mượt mà.
     static constexpr int gpuInteractiveMilliseconds = 16;
     static constexpr int gpuIdleMilliseconds = 250;
-    // Chặn vẽ vượt quá 60fps khi touch digitizer bắn 120Hz (12ms ~ 83fps max).
-    static constexpr int gpuInteractiveMinIntervalMilliseconds = 12;
+    // Pacing theo nhịp vsync (P2: gate 12ms → render 83fps × 12-17ms ≈ 100%
+    // duty của thread JS → input 120Hz bị trễ dưới fling liên hoàn → "quán
+    // tính cũ lấn át tay" + freeze. 16ms = trần ~62fps khớp panel 60Hz, duty
+    // ~72-100% tuỳ frame, chừa headroom cho input/framework).
+    static constexpr int gpuInteractiveMinIntervalMilliseconds = 16;
     static constexpr int gpuIdleMinIntervalMilliseconds = 150;
     // Watch touch streams often insert Up/Down between Moves (~100–400ms).
     // Dropping to the idle pump in those gaps is the "cụt bộ" hitch.

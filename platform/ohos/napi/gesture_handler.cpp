@@ -200,6 +200,7 @@ bool handleTouchAction(GestureState& state,
         state.pinchDistance = pinch->distance;
         state.pinchAngle = pinch->angle;
         if (mapView) {
+            mapView->flushPendingPan();
             mapView->setGestureInProgress(true);
             mapView->beginInteractionZoom();
         }
@@ -299,7 +300,11 @@ bool handleTouchAction(GestureState& state,
             if (distanceBetween(point->x, point->y, state.tapStartX, state.tapStartY) > MaxTapMovement) {
                 state.tapCandidate = false;
             }
-            mapView->moveBy(dx, dy);
+            // Coalesce: accumulate here, apply once per pump tick in
+            // MapView::pumpEvents (driven by DisplaySync/watchdog, not by input).
+            // Velocity sampling above stays per-event so fling keeps the true
+            // release speed.
+            mapView->accumulatePan(dx, dy);
             needsRender = true;
             break;
         }
@@ -315,6 +320,9 @@ bool handleTouchAction(GestureState& state,
             state.pinchActive = false;
             state.shoveActive = false;
             if (mapView) {
+                // Apply any coalesced pan first so the fling animation starts
+                // from the true finger position, not one tick behind.
+                mapView->flushPendingPan();
                 // Finger is up. MapView::syncGestureFlag keeps MapLibre's
                 // gestureInProgress set while isPanning/isScaling (fling,
                 // double-tap fly) so symbol placement stays deferred.
