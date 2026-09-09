@@ -13,6 +13,12 @@ namespace ohos {
 struct WatchRenderPolicy {
     static constexpr double minZoom = 0.0;
     static constexpr double maxZoom = 18.0;
+    // Trần zoom phủ (tile LOD cap). 09/2026: basemap chính là VietMap Tilemap
+    // vector (style "SEA Map Dark", source openmaptiles maxzoom 15) khi có
+    // VIETMAP_TILE_KEY; fallback OpenFreeMap khi key rỗng (source maxzoom 14,
+    // tile z15+ server trả 200 rỗng — đã verify). Cap 15 ≥ cả hai source-max
+    // → vô điều kiện; chỉ cần tăng (17.0, plan S1: ~4-8× tile bytes) khi có
+    // server phục vụ tile z16+.
     static constexpr double maxCoveringZoom = 15.0;
     static constexpr double maxZoomStepPerFrame = 2.0;
     static constexpr double minZoomDelta = 1.0e-6;

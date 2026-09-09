@@ -479,8 +479,10 @@ void MapView::applyTileLodShift(double nextZoom) {
     if (!map) {
         return;
     }
-    // Giữ coveringShift để giới hạn trần zoom phủ (maxCoveringZoom = 16.0),
-    // không đóng băng mức tile cũ khi zoom in để tránh triệt tiêu layer đường nhỏ.
+    // Giữ coveringShift để giới hạn trần zoom phủ (maxCoveringZoom = 15.0;
+    // giới hạn chi tiết thật nằm ở source maxzoom=14 của OpenFreeMap — xem
+    // comment watch_render_policy.hpp), không đóng băng mức tile cũ khi
+    // zoom in để tránh triệt tiêu layer đường nhỏ.
     double shift = WatchRenderPolicy::coveringShift(nextZoom);
     map->setTileLodZoomShift(shift + WatchRenderPolicy::coveringEpsilon);
 }
