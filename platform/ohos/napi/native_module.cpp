@@ -1,0 +1,2076 @@
+#include "map_view.hpp"
+
+#include "gesture_handler.hpp"
+#include "native_values.hpp"
+#include "http_bridge.hpp"
+#include "watch_render_policy.hpp"
+
+#include <mbgl/storage/resource_options.hpp>
+#include <mbgl/util/async_task.hpp>
+#include <mbgl/util/logging.hpp>
+#include <mbgl/util/run_loop.hpp>
+#include <mbgl/util/size.hpp>
+#include <mbgl/util/timer.hpp>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <dlfcn.h>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <ace/xcomponent/native_interface_xcomponent.h>
+#include <arkui/native_interface.h>
+#include <arkui/native_node.h>
+#include <arkui/native_node_napi.h>
+#include <arkui/ui_input_event.h>
+#include <napi/native_api.h>
+#include <native_window/external_window.h>
+
+namespace {
+
+using PFN_ArkUI_XComponent_FrameCallback = void (*)(ArkUI_NodeHandle node, std::uint64_t, std::uint64_t);
+using PFN_OH_ArkUI_XComponent_RegisterOnFrameCallback = int32_t (*)(ArkUI_NodeHandle node, PFN_ArkUI_XComponent_FrameCallback callback);
+using PFN_OH_ArkUI_XComponent_UnregisterOnFrameCallback = int32_t (*)(ArkUI_NodeHandle node);
+using PFN_OH_ArkUI_XComponent_SetExpectedFrameRateRange = int32_t (*)(ArkUI_NodeHandle node, OH_NativeXComponent_ExpectedRateRange* range);
+
+static PFN_OH_ArkUI_XComponent_RegisterOnFrameCallback getRegisterOnFrameCallback() {
+    static auto pfn = reinterpret_cast<PFN_OH_ArkUI_XComponent_RegisterOnFrameCallback>(
+        dlsym(RTLD_DEFAULT, "OH_ArkUI_XComponent_RegisterOnFrameCallback"));
+    return pfn;
+}
+
+static PFN_OH_ArkUI_XComponent_UnregisterOnFrameCallback getUnregisterOnFrameCallback() {
+    static auto pfn = reinterpret_cast<PFN_OH_ArkUI_XComponent_UnregisterOnFrameCallback>(
+        dlsym(RTLD_DEFAULT, "OH_ArkUI_XComponent_UnregisterOnFrameCallback"));
+    return pfn;
+}
+
+static PFN_OH_ArkUI_XComponent_SetExpectedFrameRateRange getSetExpectedFrameRateRange() {
+    static auto pfn = reinterpret_cast<PFN_OH_ArkUI_XComponent_SetExpectedFrameRateRange>(
+        dlsym(RTLD_DEFAULT, "OH_ArkUI_XComponent_SetExpectedFrameRateRange"));
+    return pfn;
+}
+
+using mbgl::ohos::createCameraOptionsObject;
+using mbgl::ohos::createStringValue;
+using mbgl::ohos::getBool;
+using mbgl::ohos::getBoundOptions;
+using mbgl::ohos::getCameraOptionsObject;
+using mbgl::ohos::getDouble;
+using mbgl::ohos::getOptionalStringProperty;
+using mbgl::ohos::getRequiredInt32Property;
+using mbgl::ohos::getString;
+using mbgl::ohos::isNullOrUndefined;
+using mbgl::ohos::isObject;
+
+class SurfaceController;
+
+std::unordered_map<ArkUI_NodeHandle, std::weak_ptr<SurfaceController>>& controllersByNode() {
+    static std::unordered_map<ArkUI_NodeHandle, std::weak_ptr<SurfaceController>> controllers;
+    return controllers;
+}
+
+std::unordered_map<OH_ArkUI_SurfaceHolder*, std::weak_ptr<SurfaceController>>& controllersByHolder() {
+    static std::unordered_map<OH_ArkUI_SurfaceHolder*, std::weak_ptr<SurfaceController>> controllers;
+    return controllers;
+}
+
+std::mutex& controllerRegistryMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+void registerController(ArkUI_NodeHandle node,
+                        OH_ArkUI_SurfaceHolder* holder,
+                        const std::shared_ptr<SurfaceController>& controller) {
+    std::lock_guard<std::mutex> lock(controllerRegistryMutex());
+    controllersByNode()[node] = controller;
+    controllersByHolder()[holder] = controller;
+}
+
+void unregisterController(ArkUI_NodeHandle node, OH_ArkUI_SurfaceHolder* holder, const SurfaceController* controller) {
+    std::lock_guard<std::mutex> lock(controllerRegistryMutex());
+
+    if (auto it = controllersByNode().find(node); it != controllersByNode().end()) {
+        const auto existing = it->second.lock();
+        if (!existing || existing.get() == controller) {
+            controllersByNode().erase(it);
+        }
+    }
+
+    if (auto it = controllersByHolder().find(holder); it != controllersByHolder().end()) {
+        const auto existing = it->second.lock();
+        if (!existing || existing.get() == controller) {
+            controllersByHolder().erase(it);
+        }
+    }
+}
+
+std::shared_ptr<SurfaceController> findController(ArkUI_NodeHandle node) {
+    std::lock_guard<std::mutex> lock(controllerRegistryMutex());
+    const auto it = controllersByNode().find(node);
+    if (it == controllersByNode().end()) {
+        return nullptr;
+    }
+    auto controller = it->second.lock();
+    if (!controller) {
+        controllersByNode().erase(it);
+    }
+    return controller;
+}
+
+std::shared_ptr<SurfaceController> findController(OH_ArkUI_SurfaceHolder* holder) {
+    std::lock_guard<std::mutex> lock(controllerRegistryMutex());
+    const auto it = controllersByHolder().find(holder);
+    if (it == controllersByHolder().end()) {
+        return nullptr;
+    }
+    auto controller = it->second.lock();
+    if (!controller) {
+        controllersByHolder().erase(it);
+    }
+    return controller;
+}
+
+napi_value getUndefined(napi_env env) {
+    napi_value result = nullptr;
+    napi_get_undefined(env, &result);
+    return result;
+}
+
+napi_value throwError(napi_env env, const char* message) {
+    napi_throw_error(env, nullptr, message);
+    return getUndefined(env);
+}
+
+ArkUI_NativeNodeAPI_1* nativeNodeApi() {
+    static auto* api = reinterpret_cast<ArkUI_NativeNodeAPI_1*>(
+        OH_ArkUI_QueryModuleInterfaceByName(ARKUI_NATIVE_NODE, "ArkUI_NativeNodeAPI_1"));
+    return api;
+}
+
+ArkUI_NativeNodeAPI_1& requireNativeNodeApi() {
+    auto* api = nativeNodeApi();
+    if (api == nullptr) {
+        throw std::runtime_error("Could not load ArkUI_NativeNodeAPI_1");
+    }
+    return *api;
+}
+
+std::uint32_t toSizeDimension(std::uint64_t value) {
+    constexpr auto maxDimension = static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max());
+    if (value > maxDimension) {
+        return std::numeric_limits<std::uint32_t>::max();
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
+mbgl::Size toSize(std::uint64_t width, std::uint64_t height) {
+    return {toSizeDimension(width), toSizeDimension(height)};
+}
+
+bool exposedResourceOptionsEqual(const mbgl::ResourceOptions& lhs, const mbgl::ResourceOptions& rhs) {
+    return lhs.apiKey() == rhs.apiKey() && lhs.cachePath() == rhs.cachePath() && lhs.assetPath() == rhs.assetPath();
+}
+
+bool isValidFrameRateRange(const OH_NativeXComponent_ExpectedRateRange& range) {
+    return range.min > 0 && range.max >= range.min && range.expected >= range.min && range.expected <= range.max;
+}
+
+bool parseFrameRateRange(napi_env env, napi_value value, OH_NativeXComponent_ExpectedRateRange& range) {
+    return isObject(env, value) && getRequiredInt32Property(env, value, "min", range.min) &&
+           getRequiredInt32Property(env, value, "max", range.max) &&
+           getRequiredInt32Property(env, value, "expected", range.expected) && isValidFrameRateRange(range);
+}
+
+void setFloatAttribute(ArkUI_NodeHandle node,
+                       ArkUI_NodeAttributeType attribute,
+                       float value,
+                       const char* errorMessage) {
+    ArkUI_NumberValue numberValue{};
+    numberValue.f32 = value;
+
+    ArkUI_AttributeItem item{};
+    item.value = &numberValue;
+    item.size = 1;
+
+    if (requireNativeNodeApi().setAttribute(node, attribute, &item) != ARKUI_ERROR_CODE_NO_ERROR) {
+        throw std::runtime_error(errorMessage);
+    }
+}
+
+ArkUI_NodeHandle createNativeXComponentNode() {
+    auto& api = requireNativeNodeApi();
+    ArkUI_NodeHandle node = api.createNode(ARKUI_NODE_XCOMPONENT);
+    if (node == nullptr) {
+        throw std::runtime_error("Could not create native XComponent node");
+    }
+
+    try {
+        setFloatAttribute(node, NODE_WIDTH_PERCENT, 1.0f, "Could not set native XComponent width");
+        setFloatAttribute(node, NODE_HEIGHT_PERCENT, 1.0f, "Could not set native XComponent height");
+    } catch (...) {
+        api.disposeNode(node);
+        throw;
+    }
+
+    return node;
+}
+
+napi_value createStringArray(napi_env env, const std::vector<std::string>& values) {
+    napi_value array = nullptr;
+    napi_create_array_with_length(env, values.size(), &array);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        napi_set_element(env, array, static_cast<std::uint32_t>(i), createStringValue(env, values[i]));
+    }
+    return array;
+}
+
+void setBoolProperty(napi_env env, napi_value object, const char* name, bool value) {
+    napi_value property = nullptr;
+    napi_get_boolean(env, value, &property);
+    napi_set_named_property(env, object, name, property);
+}
+
+void setSizeProperty(napi_env env, napi_value object, const char* name, std::uint64_t value) {
+    napi_value property = nullptr;
+    napi_create_double(env, static_cast<double>(value), &property);
+    napi_set_named_property(env, object, name, property);
+}
+
+void setDoubleProperty(napi_env env, napi_value object, const char* name, double value) {
+    napi_value property = nullptr;
+    napi_create_double(env, value, &property);
+    napi_set_named_property(env, object, name, property);
+}
+
+// PERF rings (measure-only): nearest-rank percentiles over recent frames.
+template <std::size_t N>
+void pushRingSample(std::array<double, N>& ring, std::size_t& index, std::size_t& count, double value) {
+    ring[index % N] = value;
+    ++index;
+    if (count < N) {
+        ++count;
+    }
+}
+
+template <std::size_t N>
+double ringPercentile(const std::array<double, N>& ring, std::size_t count, double q) {
+    const std::size_t n = count < N ? count : N;
+    if (n == 0) {
+        return 0.0;
+    }
+    std::vector<double> sorted(ring.begin(), ring.begin() + n);
+    std::size_t k = static_cast<std::size_t>(q * static_cast<double>(n));
+    if (k >= n) {
+        k = n - 1;
+    }
+    std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(k), sorted.end());
+    return sorted[k];
+}
+
+template <std::size_t N>
+double ringMax(const std::array<double, N>& ring, std::size_t count) {
+    const std::size_t n = count < N ? count : N;
+    if (n == 0) {
+        return 0.0;
+    }
+    return *std::max_element(ring.begin(), ring.begin() + n);
+}
+
+void setStringProperty(napi_env env, napi_value object, const char* name, const std::string& value) {
+    napi_set_named_property(env, object, name, createStringValue(env, value));
+}
+
+mbgl::ohos::TouchAction toTouchAction(int32_t action) {
+    switch (action) {
+        case UI_TOUCH_EVENT_ACTION_DOWN:
+            return mbgl::ohos::TouchAction::Down;
+        case UI_TOUCH_EVENT_ACTION_MOVE:
+            return mbgl::ohos::TouchAction::Move;
+        case UI_TOUCH_EVENT_ACTION_UP:
+            return mbgl::ohos::TouchAction::Up;
+        case UI_TOUCH_EVENT_ACTION_CANCEL:
+            return mbgl::ohos::TouchAction::Cancel;
+        default:
+            return mbgl::ohos::TouchAction::Unknown;
+    }
+}
+
+void setInteractiveWake(bool wanted);
+
+class SurfaceController final : public std::enable_shared_from_this<SurfaceController> {
+public:
+    static std::shared_ptr<SurfaceController> create(ArkUI_NodeHandle node_) {
+        auto controller = std::shared_ptr<SurfaceController>(new SurfaceController(node_, nullptr, false));
+        try {
+            controller->initialize();
+        } catch (...) {
+            controller->close();
+            throw;
+        }
+        return controller;
+    }
+
+    static std::shared_ptr<SurfaceController> create(ArkUI_NodeContentHandle content_) {
+        if (content_ == nullptr) {
+            throw std::invalid_argument("Expected a NodeContent host");
+        }
+
+        auto controller = std::shared_ptr<SurfaceController>(
+            new SurfaceController(createNativeXComponentNode(), content_, true));
+        try {
+            controller->initialize();
+            controller->addNodeToContent();
+        } catch (...) {
+            controller->close();
+            throw;
+        }
+        return controller;
+    }
+
+    ~SurfaceController() { close(); }
+
+    SurfaceController(const SurfaceController&) = delete;
+    SurfaceController& operator=(const SurfaceController&) = delete;
+
+    bool isClosed() const { return closed; }
+
+    void close() {
+        if (closed) {
+            return;
+        }
+
+        closed = true;
+        disarmRenderPump();
+
+        if (frameCallbackRegistered && node != nullptr) {
+            if (auto unregisterFn = getUnregisterOnFrameCallback()) {
+                if (unregisterFn(node) != ARKUI_ERROR_CODE_NO_ERROR) {
+                    mbgl::Log::Warning(mbgl::Event::Setup, "Could not unregister XComponent frame callback");
+                }
+            }
+        }
+        frameCallbackRegistered = false;
+
+        if (auto* api = nativeNodeApi()) {
+            if (touchEventRegistered && node != nullptr) {
+                api->unregisterNodeEvent(node, NODE_TOUCH_EVENT);
+            }
+            touchEventRegistered = false;
+
+            if (nodeEventReceiverRegistered && node != nullptr) {
+                if (api->removeNodeEventReceiver(node, onNodeEvent) != ARKUI_ERROR_CODE_NO_ERROR) {
+                    mbgl::Log::Warning(mbgl::Event::Setup, "Could not remove XComponent touch event receiver");
+                }
+            }
+            nodeEventReceiverRegistered = false;
+        }
+
+        if (surfaceCallbackRegistered && holder != nullptr && surfaceCallback != nullptr &&
+            OH_ArkUI_SurfaceHolder_RemoveSurfaceCallback(holder, surfaceCallback) != ARKUI_ERROR_CODE_NO_ERROR) {
+            mbgl::Log::Warning(mbgl::Event::Setup, "Could not remove XComponent surface callback");
+        }
+        surfaceCallbackRegistered = false;
+
+        unregisterController(node, holder, this);
+        clearMapState();
+
+        if (nodeAddedToContent && content != nullptr && node != nullptr &&
+            OH_ArkUI_NodeContent_RemoveNode(content, node) != ARKUI_ERROR_CODE_NO_ERROR) {
+            mbgl::Log::Warning(mbgl::Event::Setup, "Could not remove native XComponent node from NodeContent");
+        }
+        nodeAddedToContent = false;
+        content = nullptr;
+
+        if (surfaceCallback != nullptr) {
+            OH_ArkUI_SurfaceCallback_Dispose(surfaceCallback);
+            surfaceCallback = nullptr;
+        }
+
+        if (holder != nullptr) {
+            OH_ArkUI_SurfaceHolder_Dispose(holder);
+            holder = nullptr;
+        }
+
+        if (ownsNode && node != nullptr) {
+            if (auto* api = nativeNodeApi()) {
+                api->disposeNode(node);
+            }
+        }
+
+        node = nullptr;
+    }
+
+    void onSurfaceCreated(OH_ArkUI_SurfaceHolder* eventHolder) {
+        if (closed || eventHolder != holder) {
+            return;
+        }
+
+        window = OH_ArkUI_XComponent_GetNativeWindow(holder);
+        surfaceVisible = window != nullptr;
+        if (window == nullptr) {
+            lastSurfaceError = "XComponent surface did not provide a native window";
+            return;
+        }
+
+        if (width > 0 && height > 0) {
+            updateSurface();
+        }
+    }
+
+    void onSurfaceChanged(OH_ArkUI_SurfaceHolder* eventHolder, std::uint64_t width_, std::uint64_t height_) {
+        if (closed || eventHolder != holder) {
+            return;
+        }
+
+        window = OH_ArkUI_XComponent_GetNativeWindow(holder);
+        width = width_;
+        height = height_;
+        surfaceVisible = window != nullptr;
+        updateSurface();
+        armRenderPump();
+    }
+
+    void onSurfaceDestroyed(OH_ArkUI_SurfaceHolder* eventHolder) {
+        if (closed || eventHolder != holder) {
+            return;
+        }
+
+        surfaceVisible = false;
+        disarmRenderPump();
+        clearSurface();
+        window = nullptr;
+        width = 0;
+        height = 0;
+    }
+
+    void onFrame() {
+        if (closed) {
+            return;
+        }
+
+        ++frameCallbackCount;
+        // XComponent vsync is useful when it fires, but wearable hosts often
+        // stop after the first paint. Never GPU-render unbounded here.
+        renderFrameThrottled();
+    }
+
+    void handleNodeEvent(ArkUI_NodeEvent* event) {
+        if (closed || event == nullptr || OH_ArkUI_NodeEvent_GetEventType(event) != NODE_TOUCH_EVENT) {
+            return;
+        }
+
+        auto* inputEvent = OH_ArkUI_NodeEvent_GetInputEvent(event);
+        if (inputEvent == nullptr || OH_ArkUI_UIInputEvent_GetType(inputEvent) != ARKUI_UIINPUTEVENT_TYPE_TOUCH) {
+            return;
+        }
+
+        lastTouchTime = std::chrono::steady_clock::now();
+        // PERF (measure-only): touch-dispatch cost per event (NAPI parse +
+        // accumulate + pump-arm). At 120Hz input this contends with renders
+        // for the same UI thread; watch max alongside frame stats.
+        const auto touchStart = std::chrono::steady_clock::now();
+        const bool cameraChanged = mbgl::ohos::handleTouchEvent(gesture, mapView.get(), createTouchEvent(inputEvent));
+        armRenderPump();
+        (void)cameraChanged;
+        lastTouchMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - touchStart).count();
+        if (lastTouchMs > maxTouchMs) {
+            maxTouchMs = lastTouchMs;
+        }
+    }
+
+    void pumpEvents() {
+        if (!closed && mapView) {
+            mapView->pumpEvents();
+            lastPumpMs = mapView->getLastPumpMs();
+        }
+    }
+
+    bool interactiveNow() const { return isInteractive(); }
+
+    void renderFrame() {
+        if (closed || !mapView) {
+            return;
+        }
+        // Always drain MapLibre's uv queue so HTTP/tile workers complete even
+        // before the XComponent surface exists. GPU work still requires a surface.
+        pumpEvents();
+        if (inRenderFrame || !renderingEnabled || !surfaceVisible || width == 0 || height == 0) {
+            return;
+        }
+        inRenderFrame = true;
+        try {
+            const auto gpuStart = std::chrono::steady_clock::now();
+            lastGpuRender = gpuStart;
+            mapView->renderFrame();
+            const auto gpuEnd = std::chrono::steady_clock::now();
+            // Start-stamp (đúng ý đồ WatchRenderPolicy.hpp:25 "12ms ~ 83fps max"):
+            // gate tính từ render TRƯỚC, không phải từ khi render xong. End-stamp
+            // cũ cộng thêm 12ms sau 10-13ms render → chu kỳ 22-25ms → trần ~30fps
+            // (đo P0c: mọi scenario kẹt 17-31fps dù GL 9-13ms, GPU rảnh).
+            const double gpuMs = std::chrono::duration<double, std::milli>(gpuEnd - gpuStart).count();
+            // Split attribution: lastGpuMs keeps the wall total for compat,
+            // lastPumpMs/lastGlMs tell whether the cost is event churn or GL.
+            lastGpuMs = gpuMs;
+            lastPumpMs = mapView->getLastPumpMs();
+            lastGlMs = mapView->getLastGlMs();
+            pushRingSample(glCpuRing, glCpuRingIndex, glCpuRingCount, mapView->getLastGlCpuMs());
+            if (mapView->getLastGpuWaitSampled()) {
+                pushRingSample(gpuWaitRing, gpuWaitRingIndex, gpuWaitRingCount, mapView->getLastGpuWaitMs());
+                ++gpuWaitSamples;
+            }
+            if (gpuMs > maxGpuMs) {
+                maxGpuMs = gpuMs;
+            }
+            if (lastGlMs > maxGlMs) {
+                maxGlMs = lastGlMs;
+            }
+            // Hitch on true GL cost, not pump churn.
+            if (lastGlMs >= mbgl::ohos::WatchRenderPolicy::gpuHitchMilliseconds) {
+                ++hitchCount;
+                mbgl::Log::Warning(mbgl::Event::Render,
+                                   "GPU hitch " + std::to_string(static_cast<int>(lastGlMs)) + "ms pump=" +
+                                       std::to_string(static_cast<int>(lastPumpMs)) + "ms interactive=" +
+                                       (isInteractive() ? "1" : "0"));
+            }
+        } catch (const std::exception& exception) {
+            lastSurfaceError = exception.what();
+            mbgl::Log::Error(mbgl::Event::Render, exception.what());
+        }
+        inRenderFrame = false;
+    }
+
+    void renderFrameThrottled() {
+        if (closed || !mapView || inThrottledRender) {
+            return;
+        }
+        inThrottledRender = true;
+        // Exception-safe: pumpEvents/armRenderPump không được phép kẹt cờ vĩnh
+        // viễn (nếu không, throttled pump chết hẳn — review finding M2).
+        try {
+            pumpEvents();
+            // Never restart a 0-delay uv timer from inside this callback: nested
+            // uv_run would re-enter until SIGSEGV. Switch cadence only.
+            if (isInteractive() != renderPumpInteractive || !renderPumpArmed) {
+                armRenderPump();
+            }
+            if (mapView->hasPendingRender()) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto minInterval = std::chrono::milliseconds(
+                    isInteractive() ? mbgl::ohos::WatchRenderPolicy::gpuInteractiveMinIntervalMilliseconds
+                                    : mbgl::ohos::WatchRenderPolicy::gpuIdleMinIntervalMilliseconds);
+                if (lastGpuRender.time_since_epoch().count() == 0 || now - lastGpuRender >= minInterval) {
+                    renderFrame();
+                }
+            }
+        } catch (const std::exception& exception) {
+            mbgl::Log::Error(mbgl::Event::Render,
+                             std::string("renderFrameThrottled failed: ") + exception.what());
+        }
+        inThrottledRender = false;
+    }
+
+    void reduceMemoryUse() {
+        if (!closed && mapView) {
+            mapView->reduceMemoryUse();
+        }
+    }
+
+    void setStyleUrl(std::string style_) {
+        if (closed) {
+            return;
+        }
+
+        style = std::move(style_);
+        ++styleGeneration;
+        applyDesiredStyle();
+    }
+
+    void jumpTo(mbgl::CameraOptions cameraOptions) {
+        if (closed) {
+            return;
+        }
+
+        lastCameraJumpTime = std::chrono::steady_clock::now();
+        ensureMapView().jumpTo(std::move(cameraOptions));
+        armRenderPump();
+        renderFrame();
+    }
+
+    void zoomBy(double deltaZoom) {
+        if (closed) {
+            return;
+        }
+
+        ensureMapView().addZoomDelta(deltaZoom);
+        armRenderPump();
+        renderFrameThrottled();
+    }
+
+    void setPixelRatio(float newPixelRatio) {
+        if (closed) {
+            return;
+        }
+
+        if (!mapView) {
+            if (pixelRatio == newPixelRatio) {
+                return;
+            }
+            mapView = std::make_unique<mbgl::ohos::MapView>(newPixelRatio);
+        } else if (mapView->getPixelRatio() == newPixelRatio) {
+            return;
+        } else {
+            mapView->setPixelRatio(newPixelRatio);
+        }
+
+        pixelRatio = newPixelRatio;
+        appliedStyleGeneration = 0;
+        updateSurface();
+    }
+
+    void setBounds(mbgl::BoundOptions boundOptions) {
+        if (closed) {
+            return;
+        }
+
+        ensureMapView().setBounds(std::move(boundOptions));
+        renderFrame();
+    }
+
+    void setRenderingEnabled(bool enabled) {
+        if (closed) {
+            return;
+        }
+
+        renderingEnabled = enabled;
+        if (enabled) {
+            armRenderPump();
+            renderFrame();
+        } else {
+            disarmRenderPump();
+        }
+    }
+
+    bool setFrameRateRange(const OH_NativeXComponent_ExpectedRateRange& range) {
+        if (closed || node == nullptr) {
+            return false;
+        }
+
+        if (auto pfn = getSetExpectedFrameRateRange()) {
+            OH_NativeXComponent_ExpectedRateRange mutableRange = range;
+            if (pfn(node, &mutableRange) != ARKUI_ERROR_CODE_NO_ERROR) {
+                return false;
+            }
+        }
+
+        frameRateRange = range;
+        return true;
+    }
+
+    void setTileCacheEnabled(bool enabled) {
+        if (closed) {
+            return;
+        }
+
+        ensureMapView().setTileCacheEnabled(enabled);
+    }
+
+    void setClientOptions(std::string clientName, std::string clientVersion) {
+        if (closed) {
+            return;
+        }
+
+        if (!mapView && clientName.empty() && clientVersion.empty()) {
+            return;
+        }
+        if (mapView && mapView->getClientName() == clientName && mapView->getClientVersion() == clientVersion) {
+            return;
+        }
+
+        ensureMapView().setClientOptions(std::move(clientName), std::move(clientVersion));
+        appliedStyleGeneration = 0;
+        applyDesiredStyle();
+        renderFrame();
+    }
+
+    void setResourceOptions(const std::optional<std::string>& apiKey,
+                            const std::optional<std::string>& cachePath,
+                            const std::optional<std::string>& assetPath) {
+        if (closed) {
+            return;
+        }
+        if (!mapView && !apiKey && !cachePath && !assetPath) {
+            return;
+        }
+
+        auto& currentMapView = ensureMapView();
+        auto resourceOptions = currentMapView.getResourceOptions().clone();
+        if (apiKey) {
+            resourceOptions.withApiKey(*apiKey);
+        }
+        if (cachePath) {
+            resourceOptions.withCachePath(*cachePath);
+        }
+        if (assetPath) {
+            resourceOptions.withAssetPath(*assetPath);
+        }
+
+        if (exposedResourceOptionsEqual(resourceOptions, currentMapView.getResourceOptions())) {
+            return;
+        }
+
+        currentMapView.setResourceOptions(std::move(resourceOptions));
+        appliedStyleGeneration = 0;
+        applyDesiredStyle();
+        renderFrame();
+    }
+
+    float getPixelRatio() const { return mapView ? mapView->getPixelRatio() : pixelRatio; }
+
+    std::vector<std::string> getStyleAttributions() {
+        if (closed) {
+            return {};
+        }
+
+        return ensureMapView().getStyleAttributions();
+    }
+
+    mbgl::CameraOptions getCameraOptions() {
+        if (closed) {
+            return {};
+        }
+
+        return ensureMapView().getCameraOptions();
+    }
+
+    napi_value createSurfaceStateObject(napi_env env) {
+        updateFrameRates();
+
+        const bool hasWindow = window != nullptr;
+        const bool hasSurface = hasWindow && width > 0 && height > 0;
+        const bool hasMap = mapView && mapView->hasMap();
+        const bool needsRender = mapView && mapView->hasPendingRender();
+        const bool interactive = isInteractive();
+        const bool styleLoaded = mapView && mapView->hasLoadedStyle();
+        const bool mapLoaded = mapView && mapView->hasLoadedMap();
+        const bool fullyLoaded = mapView && mapView->isFullyLoaded();
+        std::string backendLabel;
+        if (mapView && mapView->getGlesContextClientVersion() > 0) {
+            backendLabel = std::string{"OpenGL ES "} + std::to_string(mapView->getGlesContextClientVersion());
+        } else if (mapView && !mapView->getRendererDiagnostic().empty()) {
+            backendLabel = "Vulkan";
+        }
+
+        napi_value object = nullptr;
+        napi_create_object(env, &object);
+        setSizeProperty(env, object, "width", width);
+        setSizeProperty(env, object, "height", height);
+        setBoolProperty(env, object, "hasWindow", hasWindow);
+        setBoolProperty(env, object, "hasSurface", hasSurface);
+        setBoolProperty(env, object, "hasMap", hasMap);
+        setBoolProperty(env, object, "needsRender", needsRender);
+        setBoolProperty(env, object, "interactive", interactive);
+        setBoolProperty(env, object, "styleLoaded", styleLoaded);
+        setBoolProperty(env, object, "mapLoaded", mapLoaded);
+        setBoolProperty(env, object, "fullyLoaded", fullyLoaded);
+        setDoubleProperty(env, object, "renderedFrameRate", renderedFrameRate);
+        setDoubleProperty(env, object, "frameCallbackRate", frameCallbackRate);
+        setDoubleProperty(env, object, "lastGpuMs", lastGpuMs);
+        setDoubleProperty(env, object, "maxGpuMs", maxGpuMs);
+        setDoubleProperty(env, object, "lastPumpMs", lastPumpMs);
+        setDoubleProperty(env, object, "lastGlMs", lastGlMs);
+        setDoubleProperty(env, object, "maxGlMs", maxGlMs);
+        setDoubleProperty(env, object, "glP50", ringPercentile(glCpuRing, glCpuRingCount, 0.50));
+        setDoubleProperty(env, object, "glP95", ringPercentile(glCpuRing, glCpuRingCount, 0.95));
+        setDoubleProperty(env, object, "glP99", ringPercentile(glCpuRing, glCpuRingCount, 0.99));
+        setDoubleProperty(env, object, "gpuWaitLast", mapView ? mapView->getLastGpuWaitMs() : 0.0);
+        setDoubleProperty(env, object, "gpuWaitP50", ringPercentile(gpuWaitRing, gpuWaitRingCount, 0.50));
+        setDoubleProperty(env, object, "gpuWaitMax", ringMax(gpuWaitRing, gpuWaitRingCount));
+        setSizeProperty(env, object, "gpuWaitSamples", gpuWaitSamples);
+        setDoubleProperty(env, object, "touchMs", lastTouchMs);
+        setDoubleProperty(env, object, "touchMaxMs", maxTouchMs);
+        setSizeProperty(env, object, "hitchCount", hitchCount);
+        if (!backendLabel.empty()) {
+            setStringProperty(env, object, "backend", backendLabel);
+        }
+        setBoolProperty(env, object, "surfaceVisible", surfaceVisible);
+        if (!lastSurfaceError.empty()) {
+            setStringProperty(env, object, "lastSurfaceError", lastSurfaceError);
+        }
+        if (mapView && !mapView->getLastMapLoadError().empty()) {
+            setStringProperty(env, object, "lastMapLoadError", mapView->getLastMapLoadError());
+        }
+        if (mapView && !mapView->getLastRenderError().empty()) {
+            setStringProperty(env, object, "lastRenderError", mapView->getLastRenderError());
+        }
+        if (mapView && !mapView->getLastStyleImageMissing().empty()) {
+            setStringProperty(env, object, "lastStyleImageMissing", mapView->getLastStyleImageMissing());
+        }
+        if (mapView && !mapView->getLastGlyphsError().empty()) {
+            setStringProperty(env, object, "lastGlyphsError", mapView->getLastGlyphsError());
+        }
+        if (mapView && !mapView->getLastSpritesError().empty()) {
+            setStringProperty(env, object, "lastSpritesError", mapView->getLastSpritesError());
+        }
+        return object;
+    }
+
+private:
+    SurfaceController(ArkUI_NodeHandle node_, ArkUI_NodeContentHandle content_, bool ownsNode_)
+        : node(node_),
+          content(content_),
+          ownsNode(ownsNode_) {}
+
+    void initialize() {
+        if (node == nullptr) {
+            throw std::invalid_argument("Expected an XComponent node");
+        }
+
+        holder = OH_ArkUI_SurfaceHolder_Create(node);
+        if (holder == nullptr) {
+            throw std::runtime_error("Could not create XComponent surface holder");
+        }
+
+        surfaceCallback = OH_ArkUI_SurfaceCallback_Create();
+        if (surfaceCallback == nullptr) {
+            throw std::runtime_error("Could not create XComponent surface callback");
+        }
+
+        OH_ArkUI_SurfaceCallback_SetSurfaceCreatedEvent(surfaceCallback, handleSurfaceCreated);
+        OH_ArkUI_SurfaceCallback_SetSurfaceChangedEvent(surfaceCallback, handleSurfaceChanged);
+        OH_ArkUI_SurfaceCallback_SetSurfaceDestroyedEvent(surfaceCallback, handleSurfaceDestroyed);
+
+        registerController(node, holder, shared_from_this());
+
+        if (OH_ArkUI_SurfaceHolder_AddSurfaceCallback(holder, surfaceCallback) != ARKUI_ERROR_CODE_NO_ERROR) {
+            throw std::runtime_error("Could not add XComponent surface callback");
+        }
+        surfaceCallbackRegistered = true;
+
+        if (auto registerFn = getRegisterOnFrameCallback()) {
+            if (registerFn(node, onFrame) == ARKUI_ERROR_CODE_NO_ERROR) {
+                frameCallbackRegistered = true;
+            } else {
+                mbgl::Log::Warning(mbgl::Event::Setup, "Could not register XComponent frame callback");
+            }
+        }
+
+        auto& api = requireNativeNodeApi();
+        if (api.addNodeEventReceiver(node, onNodeEvent) != ARKUI_ERROR_CODE_NO_ERROR) {
+            throw std::runtime_error("Could not add XComponent touch event receiver");
+        }
+        nodeEventReceiverRegistered = true;
+
+        if (api.registerNodeEvent(node, NODE_TOUCH_EVENT, 0, nullptr) != ARKUI_ERROR_CODE_NO_ERROR) {
+            throw std::runtime_error("Could not register XComponent touch event");
+        }
+        touchEventRegistered = true;
+    }
+
+    void addNodeToContent() {
+        if (content == nullptr || node == nullptr) {
+            throw std::invalid_argument("Expected a NodeContent host");
+        }
+        if (OH_ArkUI_NodeContent_AddNode(content, node) != ARKUI_ERROR_CODE_NO_ERROR) {
+            throw std::runtime_error("Could not add native XComponent node to NodeContent");
+        }
+        nodeAddedToContent = true;
+    }
+
+    static void handleSurfaceCreated(OH_ArkUI_SurfaceHolder* holder) {
+        if (auto controller = findController(holder)) {
+            controller->onSurfaceCreated(holder);
+        }
+    }
+
+    static void handleSurfaceChanged(OH_ArkUI_SurfaceHolder* holder, std::uint64_t width, std::uint64_t height) {
+        if (auto controller = findController(holder)) {
+            controller->onSurfaceChanged(holder, width, height);
+        }
+    }
+
+    static void handleSurfaceDestroyed(OH_ArkUI_SurfaceHolder* holder) {
+        if (auto controller = findController(holder)) {
+            controller->onSurfaceDestroyed(holder);
+        }
+    }
+
+    static void onFrame(ArkUI_NodeHandle node, std::uint64_t, std::uint64_t) {
+        if (auto controller = findController(node)) {
+            controller->onFrame();
+        }
+    }
+
+    static void onNodeEvent(ArkUI_NodeEvent* event) {
+        if (event == nullptr) {
+            return;
+        }
+        if (auto controller = findController(OH_ArkUI_NodeEvent_GetNodeHandle(event))) {
+            controller->handleNodeEvent(event);
+        }
+    }
+
+    float coordinateScale() const {
+        constexpr float baseDensityScale = 2.0f;
+        constexpr float panSensitivity = 1.0f;
+        return baseDensityScale * panSensitivity; // = 2.0f
+    }
+
+    mbgl::ohos::TouchPoint touchPointAt(const ArkUI_UIInputEvent* event, std::uint32_t pointerIndex) const {
+        const auto scale = coordinateScale();
+        return {
+            OH_ArkUI_PointerEvent_GetPointerId(event, pointerIndex),
+            OH_ArkUI_PointerEvent_GetXByIndex(event, pointerIndex) * scale,
+            OH_ArkUI_PointerEvent_GetYByIndex(event, pointerIndex) * scale,
+        };
+    }
+
+    mbgl::ohos::TouchEvent createTouchEvent(const ArkUI_UIInputEvent* event) const {
+        mbgl::ohos::TouchEvent touchEvent;
+        touchEvent.action = toTouchAction(OH_ArkUI_UIInputEvent_GetAction(event));
+
+        const auto pointerCount = OH_ArkUI_PointerEvent_GetPointerCount(event);
+        touchEvent.points.reserve(pointerCount);
+        for (std::uint32_t i = 0; i < pointerCount; ++i) {
+            touchEvent.points.push_back(touchPointAt(event, i));
+        }
+
+        std::uint32_t changedPointerId = 0;
+        const bool hasChangedPointerId = OH_ArkUI_PointerEvent_GetChangedPointerId(event, &changedPointerId) ==
+                                         ARKUI_ERROR_CODE_NO_ERROR;
+
+        std::optional<std::uint32_t> changedIndex;
+        if (hasChangedPointerId) {
+            touchEvent.id = static_cast<int32_t>(changedPointerId);
+            for (std::uint32_t i = 0; i < pointerCount; ++i) {
+                if (touchEvent.points[i].id == touchEvent.id) {
+                    changedIndex = i;
+                    break;
+                }
+            }
+        } else if (!touchEvent.points.empty()) {
+            changedIndex = 0;
+        }
+
+        if (changedIndex) {
+            const auto& changedPoint = touchEvent.points[*changedIndex];
+            touchEvent.id = changedPoint.id;
+            touchEvent.x = changedPoint.x;
+            touchEvent.y = changedPoint.y;
+        } else {
+            const auto scale = coordinateScale();
+            touchEvent.x = OH_ArkUI_PointerEvent_GetX(event) * scale;
+            touchEvent.y = OH_ArkUI_PointerEvent_GetY(event) * scale;
+        }
+
+        return touchEvent;
+    }
+
+    void clearSurface() {
+        if (mapView) {
+            if (mbgl::ohos::hasActiveGesture(gesture)) {
+                mapView->setGestureInProgress(false);
+            }
+            mapView->clearSurface();
+        }
+        appliedStyleGeneration = 0;
+        mbgl::ohos::resetGestureState(gesture);
+    }
+
+    void clearMapState() {
+        clearSurface();
+        window = nullptr;
+        width = 0;
+        height = 0;
+        surfaceVisible = false;
+        mapView.reset();
+    }
+
+    void applyDesiredStyle() {
+        if (closed || !mapView || !mapView->hasMap() || style.empty() || appliedStyleGeneration == styleGeneration) {
+            return;
+        }
+
+        mapView->setStyleURL(style);
+        appliedStyleGeneration = styleGeneration;
+    }
+
+    void updateSurface() {
+        if (closed) {
+            return;
+        }
+
+        auto& currentMapView = ensureMapView();
+        if (window == nullptr || width == 0 || height == 0) {
+            return;
+        }
+
+        try {
+            const bool needsStyleReapply = !currentMapView.hasMap() || currentMapView.getNativeWindow() != window;
+            currentMapView.setSurface(window, toSize(width, height));
+            if (needsStyleReapply) {
+                appliedStyleGeneration = 0;
+            }
+            applyDesiredStyle();
+            lastSurfaceError.clear();
+            armRenderPump();
+            renderFrame();
+        } catch (const std::exception& exception) {
+            lastSurfaceError = exception.what();
+            clearSurface();
+            mbgl::Log::Error(mbgl::Event::Render, exception.what());
+        }
+    }
+
+    bool isInteractive() const {
+        if (mbgl::ohos::hasActiveGesture(gesture) || (mapView && mapView->isInteractive())) {
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (lastTouchTime.time_since_epoch().count() != 0 &&
+            now - lastTouchTime <
+                std::chrono::milliseconds(mbgl::ohos::WatchRenderPolicy::gpuInteractiveHoldMilliseconds)) {
+            return true;
+        }
+        if (lastCameraJumpTime.time_since_epoch().count() != 0 &&
+            now - lastCameraJumpTime < std::chrono::milliseconds(2000)) {
+            return true;
+        }
+        return false;
+    }
+
+    void armRenderPump() {
+        if (closed || !renderingEnabled || window == nullptr || width == 0 || height == 0) {
+            disarmRenderPump();
+            return;
+        }
+
+        const bool interactive = isInteractive();
+        if (renderPumpArmed && renderPumpInteractive == interactive) {
+            return;
+        }
+
+        // Backup pump. Never run 16–32ms while idle: a full GL frame is ~30ms
+        // on this watch and that rate trips APP_INPUT_BLOCK. Interactive pan
+        // and camera animations need ~30fps or fling looks like a jump.
+        renderPumpArmed = true;
+        const bool becameInteractive = interactive && !renderPumpInteractive;
+        renderPumpInteractive = interactive;
+        vsyncWatchdog.stop();
+        vsyncFallbackTimer.stop();
+        // uv timers only fire when the MapLibre loop is pumped, and a 0ms first
+        // timeout re-enters uv_run from this callback (stack overflow). Drag is
+        // painted from MOVE via DisplaySync 60Hz; fling uses the 33ms JS-thread
+        // watchdog as backup while DisplaySync is stopped.
+        setInteractiveWake(interactive);
+        if (!interactive) {
+            const auto idle = mbgl::Milliseconds(mbgl::ohos::WatchRenderPolicy::gpuIdleMilliseconds);
+            vsyncFallbackTimer.start(idle, idle, [this] { renderFrameThrottled(); });
+        }
+        if (becameInteractive) {
+            maxGpuMs = 0.0;
+            maxGlMs = 0.0;
+            hitchCount = 0;
+            maxTouchMs = 0.0;
+            glCpuRingIndex = 0;
+            glCpuRingCount = 0;
+            gpuWaitRingIndex = 0;
+            gpuWaitRingCount = 0;
+            gpuWaitSamples = 0;
+        }
+    }
+
+    void disarmRenderPump() {
+        renderPumpArmed = false;
+        renderPumpInteractive = false;
+        setInteractiveWake(false);
+        vsyncWatchdog.stop();
+        vsyncFallbackTimer.stop();
+    }
+
+    mbgl::ohos::MapView& ensureMapView() {
+        if (!mapView) {
+            mapView = std::make_unique<mbgl::ohos::MapView>(pixelRatio);
+            mapView->setRepaintCallback([this] { renderFrameThrottled(); });
+        }
+        return *mapView;
+    }
+
+    void updateFrameRates() {
+        const auto now = std::chrono::steady_clock::now();
+        const auto renderedFrames = mapView ? mapView->getRenderedFrameCount() : 0;
+        const auto frameCallbacks = frameCallbackCount;
+
+        if (frameRateSampleTime.time_since_epoch().count() == 0) {
+            frameRateSampleTime = now;
+            frameRateRenderedFrames = renderedFrames;
+            frameRateCallbacks = frameCallbacks;
+            return;
+        }
+
+        const auto elapsed = std::chrono::duration<double>(now - frameRateSampleTime).count();
+        if (elapsed <= 0.0) {
+            return;
+        }
+
+        renderedFrameRate = static_cast<double>(renderedFrames - frameRateRenderedFrames) / elapsed;
+        frameCallbackRate = static_cast<double>(frameCallbacks - frameRateCallbacks) / elapsed;
+        frameRateSampleTime = now;
+        frameRateRenderedFrames = renderedFrames;
+        frameRateCallbacks = frameCallbacks;
+    }
+
+    ArkUI_NodeHandle node = nullptr;
+    ArkUI_NodeContentHandle content = nullptr;
+    OH_ArkUI_SurfaceHolder* holder = nullptr;
+    OH_ArkUI_SurfaceCallback* surfaceCallback = nullptr;
+    OHNativeWindow* window = nullptr;
+    std::unique_ptr<mbgl::ohos::MapView> mapView;
+    std::string style;
+    std::uint64_t styleGeneration = 0;
+    std::uint64_t appliedStyleGeneration = 0;
+    float pixelRatio = 1.0f;
+    std::uint64_t width = 0;
+    std::uint64_t height = 0;
+    bool renderingEnabled = true;
+    bool frameCallbackRegistered = false;
+    bool nodeEventReceiverRegistered = false;
+    bool touchEventRegistered = false;
+    bool surfaceCallbackRegistered = false;
+    bool ownsNode = false;
+    bool nodeAddedToContent = false;
+    bool closed = false;
+    std::uint64_t frameCallbackCount = 0;
+    bool surfaceVisible = false;
+    bool inRenderFrame = false;
+    mbgl::util::Timer vsyncFallbackTimer;
+    mbgl::util::Timer vsyncWatchdog;
+    bool renderPumpArmed = false;
+    bool renderPumpInteractive = false;
+    bool inThrottledRender = false;
+    std::chrono::steady_clock::time_point lastTouchTime{};
+    std::chrono::steady_clock::time_point lastCameraJumpTime{};
+    double lastGpuMs = 0.0;
+    double maxGpuMs = 0.0;
+    double lastPumpMs = 0.0;
+    double lastGlMs = 0.0;
+    double maxGlMs = 0.0;
+    double lastTouchMs = 0.0;
+    double maxTouchMs = 0.0;
+    // PERF rings (measure-only): gl CPU-side samples every frame (300),
+    // GPU-drain samples every 30th frame (120).
+    static constexpr std::size_t kGlCpuRingSize = 300;
+    static constexpr std::size_t kGpuWaitRingSize = 120;
+    std::array<double, kGlCpuRingSize> glCpuRing{};
+    std::size_t glCpuRingIndex = 0;
+    std::size_t glCpuRingCount = 0;
+    std::array<double, kGpuWaitRingSize> gpuWaitRing{};
+    std::size_t gpuWaitRingIndex = 0;
+    std::size_t gpuWaitRingCount = 0;
+    std::uint64_t gpuWaitSamples = 0;
+    std::uint64_t hitchCount = 0;
+    std::uint64_t frameCountWhenWatchdogArmed = 0;
+    std::chrono::steady_clock::time_point lastGpuRender{};
+    std::string lastSurfaceError;
+    mbgl::ohos::GestureState gesture;
+    std::optional<OH_NativeXComponent_ExpectedRateRange> frameRateRange;
+    std::chrono::steady_clock::time_point frameRateSampleTime;
+    std::uint64_t frameRateRenderedFrames = 0;
+    std::uint64_t frameRateCallbacks = 0;
+    double renderedFrameRate = 0.0;
+    double frameCallbackRate = 0.0;
+};
+
+napi_threadsafe_function g_renderTsfn = nullptr;
+std::atomic<bool> g_interactiveWakeWanted{false};
+std::atomic<bool> g_interactiveWakeAlive{false};
+
+void setInteractiveWake(bool wanted) {
+    g_interactiveWakeWanted.store(wanted);
+    if (!wanted) {
+        return;
+    }
+    bool expected = false;
+    if (!g_interactiveWakeAlive.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    if (g_renderTsfn) {
+        napi_acquire_threadsafe_function(g_renderTsfn);
+    }
+    try {
+        std::thread([] {
+        // Tick 8ms + gate 16ms (P2 pacing): trần ~62fps khớp panel 60Hz; tick
+        // rỗng early-out ~0ms. Idle vẫn dùng fallback thưa 250ms.
+        const auto interval = std::chrono::milliseconds(8);
+            for (;;) {
+                while (g_interactiveWakeWanted.load()) {
+                    std::this_thread::sleep_for(interval);
+                    if (!g_interactiveWakeWanted.load()) {
+                        break;
+                    }
+                    if (g_renderTsfn) {
+                        napi_call_threadsafe_function(g_renderTsfn, nullptr, napi_tsfn_nonblocking);
+                    }
+                }
+                // Lost-wake race: re-arm có thể rơi đúng lúc thread đang thoát
+                // (wanted=true, alive vừa false, không còn thread nào). Store
+                // alive=false TRƯỚC rồi re-check; nếu re-arm xảy ra sau khi ta
+                // store nhưng CAS của caller đã fail → ta tự nhận lại nhiệm vụ.
+                g_interactiveWakeAlive.store(false);
+                if (!g_interactiveWakeWanted.load()) {
+                    break;
+                }
+                bool rearmExpected = false;
+                if (!g_interactiveWakeAlive.compare_exchange_strong(rearmExpected, true)) {
+                    break;  // caller khác đã spawn thread mới và giữ alive=true
+                }
+            }
+            if (g_renderTsfn) {
+                napi_release_threadsafe_function(g_renderTsfn, napi_tsfn_release);
+            }
+        }).detach();
+    } catch (const std::exception& exception) {
+        // std::thread ctor throw (hết resource): phải trả alive=false + release
+        // ref vừa acquire, nếu không wake chết vĩnh viễn + leak TSFN ref.
+        mbgl::Log::Error(mbgl::Event::Render,
+                         std::string("Could not spawn render wake thread: ") + exception.what());
+        g_interactiveWakeAlive.store(false);
+        if (g_renderTsfn) {
+            napi_release_threadsafe_function(g_renderTsfn, napi_tsfn_release);
+        }
+    }
+}
+
+void forEachLiveController(const std::function<void(SurfaceController&)>& fn) {
+    std::vector<std::shared_ptr<SurfaceController>> live;
+    {
+        std::lock_guard<std::mutex> lock(controllerRegistryMutex());
+        for (const auto& entry : controllersByNode()) {
+            if (auto controller = entry.second.lock()) {
+                live.push_back(std::move(controller));
+            }
+        }
+    }
+    for (auto& controller : live) {
+        fn(*controller);
+    }
+}
+
+void ensureMapLibreRunLoop() {
+    static mbgl::util::RunLoop loop;
+    static mbgl::util::AsyncTask wakeRender([] {
+        forEachLiveController([](SurfaceController& controller) { controller.renderFrameThrottled(); });
+    });
+    static bool hooked = false;
+    if (!hooked) {
+        hooked = true;
+        loop.setPlatformCallback([] { wakeRender.send(); });
+    }
+}
+
+napi_value emptyRenderPumpJs(napi_env env, napi_callback_info /*info*/) {
+    return getUndefined(env);
+}
+
+void callJsRenderPump(napi_env env, napi_value /*jsCallback*/, void* /*context*/, void* /*data*/) {
+    if (!env) {
+        return;
+    }
+    forEachLiveController([](SurfaceController& controller) { controller.renderFrameThrottled(); });
+}
+
+void ensureRenderPumpTsfn(napi_env env) {
+    if (g_renderTsfn) {
+        return;
+    }
+    napi_value asyncName = nullptr;
+    napi_create_string_utf8(env, "MapLibreRenderPump", NAPI_AUTO_LENGTH, &asyncName);
+    napi_value jsFn = nullptr;
+    napi_create_function(env, "mapLibreRenderPump", NAPI_AUTO_LENGTH, emptyRenderPumpJs, nullptr, &jsFn);
+    if (napi_create_threadsafe_function(env,
+                                        jsFn,
+                                        nullptr,
+                                        asyncName,
+                                        0,
+                                        1,
+                                        nullptr,
+                                        nullptr,
+                                        nullptr,
+                                        callJsRenderPump,
+                                        &g_renderTsfn) != napi_ok) {
+        g_renderTsfn = nullptr;
+        mbgl::Log::Warning(mbgl::Event::Setup, "Could not create interactive render pump TSFN");
+    }
+}
+
+using ControllerHandle = std::shared_ptr<SurfaceController>;
+
+napi_value destroy(napi_env env, napi_callback_info info);
+napi_value renderFrame(napi_env env, napi_callback_info info);
+napi_value reduceMemoryUse(napi_env env, napi_callback_info info);
+napi_value setStyleUrl(napi_env env, napi_callback_info info);
+napi_value jumpTo(napi_env env, napi_callback_info info);
+napi_value zoomBy(napi_env env, napi_callback_info info);
+napi_value setPixelRatio(napi_env env, napi_callback_info info);
+napi_value setBounds(napi_env env, napi_callback_info info);
+napi_value setRenderingEnabled(napi_env env, napi_callback_info info);
+napi_value setFrameRateRange(napi_env env, napi_callback_info info);
+napi_value setTileCacheEnabled(napi_env env, napi_callback_info info);
+napi_value setClientOptions(napi_env env, napi_callback_info info);
+napi_value setResourceOptions(napi_env env, napi_callback_info info);
+napi_value getPixelRatio(napi_env env, napi_callback_info info);
+napi_value getStyleAttributions(napi_env env, napi_callback_info info);
+napi_value getSurfaceState(napi_env env, napi_callback_info info);
+napi_value getCameraOptions(napi_env env, napi_callback_info info);
+napi_value isInteractive(napi_env env, napi_callback_info info);
+
+ControllerHandle resolveController(napi_env env, napi_value thisArg) {
+    void* nativeController = nullptr;
+    if (napi_unwrap(env, thisArg, &nativeController) != napi_ok || nativeController == nullptr) {
+        throwError(env, "Expected a MapLibre XComponent context");
+        return nullptr;
+    }
+
+    auto* controller = static_cast<ControllerHandle*>(nativeController);
+    if (controller == nullptr || !*controller) {
+        throwError(env, "Expected a MapLibre XComponent context");
+        return nullptr;
+    }
+
+    return *controller;
+}
+
+void finalizeController(napi_env, void* data, void*) {
+    auto* controller = static_cast<ControllerHandle*>(data);
+    if (controller != nullptr) {
+        if (*controller) {
+            (*controller)->close();
+        }
+        delete controller;
+    }
+}
+
+const napi_property_descriptor* contextProperties(std::size_t& count) {
+    static napi_property_descriptor properties[] = {
+        {"destroy", nullptr, destroy, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getCameraOptions", nullptr, getCameraOptions, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getPixelRatio", nullptr, getPixelRatio, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getStyleAttributions", nullptr, getStyleAttributions, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getSurfaceState", nullptr, getSurfaceState, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"isInteractive", nullptr, isInteractive, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"jumpTo", nullptr, jumpTo, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"zoomBy", nullptr, zoomBy, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"reduceMemoryUse", nullptr, reduceMemoryUse, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"renderFrame", nullptr, renderFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setBounds", nullptr, setBounds, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setClientOptions", nullptr, setClientOptions, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setFrameRateRange", nullptr, setFrameRateRange, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setPixelRatio", nullptr, setPixelRatio, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setRenderingEnabled", nullptr, setRenderingEnabled, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setResourceOptions", nullptr, setResourceOptions, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setTileCacheEnabled", nullptr, setTileCacheEnabled, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setStyleUrl", nullptr, setStyleUrl, nullptr, nullptr, nullptr, napi_default, nullptr},
+    };
+    count = sizeof(properties) / sizeof(properties[0]);
+    return properties;
+}
+
+napi_value createContextObject(napi_env env, ControllerHandle controller) {
+    napi_value object = nullptr;
+    if (napi_create_object(env, &object) != napi_ok || object == nullptr) {
+        return throwError(env, "Could not create MapLibre XComponent context");
+    }
+
+    std::size_t propertyCount = 0;
+    const auto* properties = contextProperties(propertyCount);
+    if (napi_define_properties(env, object, propertyCount, properties) != napi_ok) {
+        return throwError(env, "Could not define MapLibre XComponent context");
+    }
+
+    auto* boxedController = new ControllerHandle(std::move(controller));
+    if (napi_wrap(env, object, boxedController, finalizeController, nullptr, nullptr) != napi_ok) {
+        delete boxedController;
+        return throwError(env, "Could not wrap MapLibre XComponent context");
+    }
+
+    return object;
+}
+
+ControllerHandle createController(ArkUI_NodeContentHandle content) {
+    return SurfaceController::create(content);
+}
+
+napi_value createMap(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected a NodeContent host");
+    }
+
+    ArkUI_NodeContentHandle content = nullptr;
+    if (OH_ArkUI_GetNodeContentFromNapiValue(env, argv[0], &content) != ARKUI_ERROR_CODE_NO_ERROR ||
+        content == nullptr) {
+        return throwError(env, "Expected a NodeContent host");
+    }
+
+    try {
+        ensureMapLibreRunLoop();
+        return createContextObject(env, createController(content));
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+}
+
+napi_value destroy(napi_env env, napi_callback_info info) {
+    std::size_t argc = 0;
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, nullptr, &thisArg, nullptr) != napi_ok) {
+        return throwError(env, "Expected a MapLibre XComponent context");
+    }
+
+    if (auto controller = resolveController(env, thisArg)) {
+        controller->close();
+    }
+    return getUndefined(env);
+}
+
+napi_value renderFrame(napi_env env, napi_callback_info info) {
+    std::size_t argc = 0;
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, nullptr, &thisArg, nullptr) != napi_ok) {
+        return throwError(env, "Expected a MapLibre XComponent context");
+    }
+
+    if (auto controller = resolveController(env, thisArg)) {
+        // P2: mọi đường render (poll 1s, displaySync pump lúc load, resume...)
+        // đều qua gate — displaySync 40Hz × frame spike 100ms từng bão hòa
+        // thread JS lúc load (140% duty). Gate 16ms giữ trần ~62fps.
+        // runLoopOnce vẫn chạy mỗi call (pump HTTP/tile không phụ thuộc render).
+        controller->renderFrameThrottled();
+    }
+    return getUndefined(env);
+}
+
+napi_value reduceMemoryUse(napi_env env, napi_callback_info info) {
+    std::size_t argc = 0;
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, nullptr, &thisArg, nullptr) != napi_ok) {
+        return throwError(env, "Expected a MapLibre XComponent context");
+    }
+
+    if (auto controller = resolveController(env, thisArg)) {
+        controller->reduceMemoryUse();
+    }
+    return getUndefined(env);
+}
+
+napi_value setStyleUrl(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected style URL");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    std::string style;
+    if (!getString(env, argv[0], style)) {
+        return throwError(env, "Expected style URL string");
+    }
+
+    controller->setStyleUrl(std::move(style));
+    return getUndefined(env);
+}
+
+napi_value jumpTo(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected camera options");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    mbgl::CameraOptions cameraOptions;
+    if (!getCameraOptionsObject(env, argv[0], cameraOptions)) {
+        return throwError(env, "Expected valid camera options object");
+    }
+
+    try {
+        controller->jumpTo(std::move(cameraOptions));
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+    return getUndefined(env);
+}
+
+napi_value zoomBy(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected a zoom delta");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    double deltaZoom = 0.0;
+    if (!getDouble(env, argv[0], deltaZoom) || !std::isfinite(deltaZoom)) {
+        return throwError(env, "Expected a finite zoom delta");
+    }
+
+    try {
+        controller->zoomBy(deltaZoom);
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+    return getUndefined(env);
+}
+
+napi_value setPixelRatio(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected a pixel ratio");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    double pixelRatio = 0.0;
+    if (!getDouble(env, argv[0], pixelRatio) || !std::isfinite(pixelRatio) || pixelRatio <= 0.0) {
+        return throwError(env, "Expected a finite positive pixel ratio");
+    }
+
+    try {
+        controller->setPixelRatio(static_cast<float>(pixelRatio));
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+    return getUndefined(env);
+}
+
+napi_value setBounds(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected bounds options");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    mbgl::BoundOptions boundOptions;
+    if (!getBoundOptions(env, argv[0], boundOptions)) {
+        return throwError(env, "Expected valid bounds options object");
+    }
+
+    try {
+        controller->setBounds(std::move(boundOptions));
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+    return getUndefined(env);
+}
+
+napi_value setRenderingEnabled(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected rendering enabled boolean");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    bool enabled = false;
+    if (!getBool(env, argv[0], enabled)) {
+        return throwError(env, "Expected rendering enabled boolean");
+    }
+
+    controller->setRenderingEnabled(enabled);
+    return getUndefined(env);
+}
+
+napi_value setFrameRateRange(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected frame-rate range");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    OH_NativeXComponent_ExpectedRateRange range{};
+    if (!parseFrameRateRange(env, argv[0], range)) {
+        return throwError(env, "Expected frame-rate range object with positive min <= expected <= max");
+    }
+
+    if (!controller->setFrameRateRange(range)) {
+        return throwError(env, "Could not apply XComponent frame-rate range");
+    }
+    return getUndefined(env);
+}
+
+napi_value setTileCacheEnabled(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected tile cache enabled boolean");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    bool enabled = false;
+    if (!getBool(env, argv[0], enabled)) {
+        return throwError(env, "Expected tile cache enabled boolean");
+    }
+
+    controller->setTileCacheEnabled(enabled);
+    return getUndefined(env);
+}
+
+napi_value setClientOptions(napi_env env, napi_callback_info info) {
+    std::size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected client name and optional client version");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    std::string clientName;
+    if (!getString(env, argv[0], clientName)) {
+        return throwError(env, "Expected client name string");
+    }
+
+    std::string clientVersion;
+    if (argc > 1 && !isNullOrUndefined(env, argv[1])) {
+        if (!getString(env, argv[1], clientVersion)) {
+            return throwError(env, "Expected client version string");
+        }
+    }
+
+    try {
+        controller->setClientOptions(std::move(clientName), std::move(clientVersion));
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+    return getUndefined(env);
+}
+
+napi_value setResourceOptions(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected resource options");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+    if (!isObject(env, argv[0])) {
+        return throwError(env, "Expected resource options object");
+    }
+
+    std::optional<std::string> apiKey;
+    std::optional<std::string> cachePath;
+    std::optional<std::string> assetPath;
+    if (!getOptionalStringProperty(env, argv[0], "apiKey", apiKey) ||
+        !getOptionalStringProperty(env, argv[0], "cachePath", cachePath) ||
+        !getOptionalStringProperty(env, argv[0], "assetPath", assetPath)) {
+        return throwError(env, "Expected string resource option values");
+    }
+
+    try {
+        controller->setResourceOptions(apiKey, cachePath, assetPath);
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+    return getUndefined(env);
+}
+
+napi_value getPixelRatio(napi_env env, napi_callback_info info) {
+    std::size_t argc = 0;
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, nullptr, &thisArg, nullptr) != napi_ok) {
+        return throwError(env, "Expected a MapLibre XComponent context");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    napi_value result = nullptr;
+    napi_create_double(env, controller->getPixelRatio(), &result);
+    return result;
+}
+
+napi_value getStyleAttributions(napi_env env, napi_callback_info info) {
+    std::size_t argc = 0;
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, nullptr, &thisArg, nullptr) != napi_ok) {
+        return throwError(env, "Expected a MapLibre XComponent context");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    return createStringArray(env, controller->getStyleAttributions());
+}
+
+napi_value getSurfaceState(napi_env env, napi_callback_info info) {
+    std::size_t argc = 0;
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, nullptr, &thisArg, nullptr) != napi_ok) {
+        return throwError(env, "Expected a MapLibre XComponent context");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    return controller->createSurfaceStateObject(env);
+}
+
+napi_value getCameraOptions(napi_env env, napi_callback_info info) {
+    std::size_t argc = 0;
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, nullptr, &thisArg, nullptr) != napi_ok) {
+        return throwError(env, "Expected a MapLibre XComponent context");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    return createCameraOptionsObject(env, controller->getCameraOptions());
+}
+
+napi_value isInteractive(napi_env env, napi_callback_info info) {
+    std::size_t argc = 0;
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, nullptr, &thisArg, nullptr) != napi_ok) {
+        return throwError(env, "Expected a MapLibre XComponent context");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    napi_value result = nullptr;
+    napi_get_boolean(env, controller->interactiveNow(), &result);
+    return result;
+}
+
+static napi_threadsafe_function g_httpTsfn = nullptr;
+static napi_threadsafe_function g_httpCancelTsfn = nullptr;
+
+static void CallJsHttpBridge(napi_env env, napi_value js_callback, void* context, void* data) {
+    (void)context;
+    if (!env || !js_callback || !data) {
+        return;
+    }
+    auto* req = static_cast<mbgl::ohos::HttpBridgeRequest*>(data);
+
+    napi_value reqIdVal = nullptr;
+    napi_create_int64(env, static_cast<int64_t>(req->id), &reqIdVal);
+
+    napi_value urlVal = nullptr;
+    napi_create_string_utf8(env, req->url.c_str(), req->url.length(), &urlVal);
+
+    napi_value headersVal = nullptr;
+    napi_create_object(env, &headersVal);
+    for (const auto& kv : req->headers) {
+        napi_value val = nullptr;
+        napi_create_string_utf8(env, kv.second.c_str(), kv.second.length(), &val);
+        napi_set_named_property(env, headersVal, kv.first.c_str(), val);
+    }
+
+    napi_value args[3] = {reqIdVal, urlVal, headersVal};
+    napi_value global = nullptr;
+    napi_get_global(env, &global);
+    napi_value result = nullptr;
+    napi_call_function(env, global, js_callback, 3, args, &result);
+
+    delete req;
+}
+
+static void CallJsHttpCancel(napi_env env, napi_value js_callback, void* context, void* data) {
+    (void)context;
+    if (!env || !js_callback || !data) {
+        return;
+    }
+    auto* reqId = static_cast<uint64_t*>(data);
+
+    napi_value reqIdVal = nullptr;
+    napi_create_int64(env, static_cast<int64_t>(*reqId), &reqIdVal);
+
+    napi_value args[1] = {reqIdVal};
+    napi_value global = nullptr;
+    napi_get_global(env, &global);
+    napi_value result = nullptr;
+    napi_call_function(env, global, js_callback, 1, args, &result);
+
+    delete reqId;
+}
+
+napi_value registerHttpBridge(napi_env env, napi_callback_info info) {
+    std::size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok || argc < 1 || !args[0]) {
+        return throwError(env, "Expected a callback function for registerHttpBridge");
+    }
+
+    napi_value asyncResourceName = nullptr;
+    napi_create_string_utf8(env, "MapLibreHttpBridge", NAPI_AUTO_LENGTH, &asyncResourceName);
+
+    if (g_httpTsfn) {
+        napi_release_threadsafe_function(g_httpTsfn, napi_tsfn_release);
+        g_httpTsfn = nullptr;
+    }
+    if (g_httpCancelTsfn) {
+        napi_release_threadsafe_function(g_httpCancelTsfn, napi_tsfn_release);
+        g_httpCancelTsfn = nullptr;
+    }
+
+    napi_status status = napi_create_threadsafe_function(
+        env,
+        args[0],
+        nullptr,
+        asyncResourceName,
+        0,
+        1,
+        nullptr,
+        nullptr,
+        nullptr,
+        CallJsHttpBridge,
+        &g_httpTsfn);
+
+    if (status != napi_ok) {
+        return throwError(env, "Failed to create threadsafe function for HttpBridge");
+    }
+
+    // Optional second callback: notified when native no longer needs a
+    // request (tile out-of-viewport, map destroy). ArkTS side drops it from
+    // the queue / aborts it to save radio bandwidth on slow links.
+    if (argc >= 2 && args[1] != nullptr) {
+        napi_valuetype argType = napi_undefined;
+        if (napi_typeof(env, args[1], &argType) == napi_ok && argType == napi_function) {
+            napi_value cancelResourceName = nullptr;
+            napi_create_string_utf8(env, "MapLibreHttpBridgeCancel", NAPI_AUTO_LENGTH, &cancelResourceName);
+            napi_status cancelStatus = napi_create_threadsafe_function(
+                env,
+                args[1],
+                nullptr,
+                cancelResourceName,
+                0,
+                1,
+                nullptr,
+                nullptr,
+                nullptr,
+                CallJsHttpCancel,
+                &g_httpCancelTsfn);
+            if (cancelStatus != napi_ok) {
+                g_httpCancelTsfn = nullptr;
+            }
+        }
+    }
+
+    mbgl::ohos::setHttpBridge(
+        [](const mbgl::ohos::HttpBridgeRequest& req) {
+            if (g_httpTsfn) {
+                auto* copy = new mbgl::ohos::HttpBridgeRequest(req);
+                napi_call_threadsafe_function(g_httpTsfn, copy, napi_tsfn_nonblocking);
+            }
+        },
+        [](uint64_t id) {
+            if (g_httpCancelTsfn) {
+                auto* copy = new uint64_t(id);
+                napi_call_threadsafe_function(g_httpCancelTsfn, copy, napi_tsfn_nonblocking);
+            }
+        });
+
+    return getUndefined(env);
+}
+
+napi_value onHttpResponse(napi_env env, napi_callback_info info) {
+    std::size_t argc = 5;
+    napi_value args[5] = {nullptr};
+    if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok || argc < 5) {
+        return throwError(env, "Expected 5 arguments for onHttpResponse: reqId, statusCode, data, headers, error");
+    }
+
+    int64_t reqId = 0;
+    napi_get_value_int64(env, args[0], &reqId);
+
+    int32_t statusCode = 0;
+    napi_get_value_int32(env, args[1], &statusCode);
+
+    void* dataPtr = nullptr;
+    size_t byteLength = 0;
+    bool isArrayBuffer = false;
+    napi_is_arraybuffer(env, args[2], &isArrayBuffer);
+    if (isArrayBuffer) {
+        napi_get_arraybuffer_info(env, args[2], &dataPtr, &byteLength);
+    }
+
+    std::map<std::string, std::string> headersMap;
+    if (isObject(env, args[3])) {
+        napi_value propNames = nullptr;
+        if (napi_get_property_names(env, args[3], &propNames) == napi_ok) {
+            uint32_t length = 0;
+            napi_get_array_length(env, propNames, &length);
+            for (uint32_t i = 0; i < length; ++i) {
+                napi_value keyVal = nullptr;
+                napi_get_element(env, propNames, i, &keyVal);
+                char keyBuf[256] = {0};
+                size_t keyLen = 0;
+                napi_get_value_string_utf8(env, keyVal, keyBuf, sizeof(keyBuf) - 1, &keyLen);
+
+                napi_value propVal = nullptr;
+                napi_get_property(env, args[3], keyVal, &propVal);
+                char valBuf[1024] = {0};
+                size_t valLen = 0;
+                napi_get_value_string_utf8(env, propVal, valBuf, sizeof(valBuf) - 1, &valLen);
+
+                headersMap[std::string(keyBuf, keyLen)] = std::string(valBuf, valLen);
+            }
+        }
+    }
+
+    char errBuf[512] = {0};
+    size_t errLen = 0;
+    napi_get_value_string_utf8(env, args[4], errBuf, sizeof(errBuf) - 1, &errLen);
+    std::string errorStr(errBuf, errLen);
+
+    mbgl::ohos::dispatchHttpResponse(
+        static_cast<uint64_t>(reqId),
+        statusCode,
+        static_cast<const char*>(dataPtr),
+        byteLength,
+        headersMap,
+        errorStr);
+
+    // During pan DisplaySync 60Hz (plus the 33ms watchdog backup) already
+    // paints. GPU-on-HTTP on the JS thread is a hitch: tile parse/upload
+    // lands in the middle of a Move stream.
+    forEachLiveController([](SurfaceController& controller) {
+        if (controller.interactiveNow()) {
+            controller.pumpEvents();
+        } else {
+            controller.renderFrameThrottled();
+        }
+    });
+
+    return getUndefined(env);
+}
+
+napi_value Init(napi_env env, napi_value exports) {
+    ensureMapLibreRunLoop();
+    ensureRenderPumpTsfn(env);
+    mbgl::Log::Info(mbgl::Event::Setup, "VietMapGL native init: RunLoop + DisplaySync 60Hz + 16ms interactive watchdog / 250ms idle pump");
+    napi_property_descriptor properties[] = {
+        {"createMap", nullptr, createMap, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"registerHttpBridge", nullptr, registerHttpBridge, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"onHttpResponse", nullptr, onHttpResponse, nullptr, nullptr, nullptr, napi_default, nullptr},
+    };
+
+    napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties);
+    napi_set_named_property(env, exports, "default", exports);
+    return exports;
+}
+
+} // namespace
+
+static napi_module _module_maplibre = {
+    .nm_version = 1,
+    .nm_flags = 0,
+    .nm_filename = nullptr,
+    .nm_register_func = Init,
+    .nm_modname = "maplibre_native_ohos",
+    .nm_priv = ((void*)0),
+    .reserved = { 0 },
+};
+
+static napi_module _module_entry = {
+    .nm_version = 1,
+    .nm_flags = 0,
+    .nm_filename = nullptr,
+    .nm_register_func = Init,
+    .nm_modname = "entry",
+    .nm_priv = ((void*)0),
+    .reserved = { 0 },
+};
+
+static napi_module _module_lib = {
+    .nm_version = 1,
+    .nm_flags = 0,
+    .nm_filename = nullptr,
+    .nm_register_func = Init,
+    .nm_modname = "libmaplibre_native_ohos",
+    .nm_priv = ((void*)0),
+    .reserved = { 0 },
+};
+
+extern "C" __attribute__((constructor)) void RegisterMapLibreNativeModules(void) {
+    napi_module_register(&_module_maplibre);
+    napi_module_register(&_module_entry);
+    napi_module_register(&_module_lib);
+}

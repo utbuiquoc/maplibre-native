@@ -20,6 +20,8 @@
 #include <mbgl/util/logging.hpp>
 #include <mbgl/util/instrumentation.hpp>
 
+#include <sstream>
+
 #include <mbgl/gfx/drawable_tweaker.hpp>
 #include <mbgl/renderer/layer_tweaker.hpp>
 #include <mbgl/renderer/render_target.hpp>
@@ -93,6 +95,11 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
     MLN_TRACE_FUNC();
     auto& context = backend.getContext();
     context.setObserver(this);
+
+    // PERF instrumentation (reversible, measure-only): phase split of one frame.
+    // treeMs uses the existing createRenderTree timestamp (no new timer for tree build).
+    const double perfT0 = util::MonotonicTimer::now().count();
+    const double perfTreeMs = renderTree.getElapsedTime() * 1000.0;
 
     assert(updateParameters);
 
@@ -249,6 +256,7 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
         renderTree.getLineAtlas().upload(*uploadPass);
         renderTree.getPatternAtlas().upload(*uploadPass);
     }
+    const double perfT1 = util::MonotonicTimer::now().count();
 
     // - LAYER GROUP UPDATE ------------------------------------------------------------------------
     // Updates all layer groups and process changes
@@ -291,6 +299,7 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
         // Upload the Debug layer group
         orchestrator.visitDebugLayerGroups([&](LayerGroupBase& layerGroup) { layerGroup.upload(*uploadPass); });
     }
+    const double perfT2 = util::MonotonicTimer::now().count();
 
     const Size atlasSize = parameters.patternAtlas.getPixelSize();
     const auto& worldSize = parameters.staticData.backendSize;
@@ -448,6 +457,7 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
     // Give the layers a chance to do cleanup
     orchestrator.visitLayerGroups([&](LayerGroupBase& layerGroup) { layerGroup.postRender(orchestrator, parameters); });
     context.unbindGlobalUniformBuffers(*parameters.renderPass);
+    const double perfT3 = util::MonotonicTimer::now().count();
 
     // Ends the RenderPass
     parameters.renderPass.reset();
@@ -474,6 +484,34 @@ void Renderer::Impl::render(const RenderTree& renderTree, const std::shared_ptr<
 #endif // MLN_RENDER_BACKEND_METAL
 
     context.renderingStats().encodingTime = renderTree.getElapsedTime() - context.renderingStats().renderingTime;
+
+    // PERF log: 1 line per 30 frames. Counters may be cumulative gauges, so
+    // report deltas over the last 30 frames (dcAvg/frame, bytes/30f).
+    if (frameCount % 30 == 0) {
+        const auto& perfStats = context.renderingStats();
+        static int perfLastTotalDc = 0;
+        static std::size_t perfLastTexB = 0;
+        static std::size_t perfLastBufB = 0;
+        static std::size_t perfLastUniB = 0;
+        const double dcAvg = (perfStats.totalDrawCalls - perfLastTotalDc) / 30.0;
+        const std::size_t texB = perfStats.textureUpdateBytes - perfLastTexB;
+        const std::size_t bufB = perfStats.bufferUpdateBytes - perfLastBufB;
+        const std::size_t uniB = perfStats.uniformUpdateBytes - perfLastUniB;
+        perfLastTotalDc = perfStats.totalDrawCalls;
+        perfLastTexB = perfStats.textureUpdateBytes;
+        perfLastBufB = perfStats.bufferUpdateBytes;
+        perfLastUniB = perfStats.uniformUpdateBytes;
+        std::ostringstream perfLine;
+        perfLine.precision(1);
+        perfLine << std::fixed << "[PERF] tree=" << perfTreeMs << "ms upBkt=" << (perfT1 - perfT0) * 1000.0
+                 << "ms upTwk=" << (perfT2 - perfT1) * 1000.0 << "ms draw=" << (perfT3 - perfT2) * 1000.0
+                 << "ms pres=" << perfStats.renderingTime * 1000.0 << "ms dcAvg=" << dcAvg << "/f texB=" << texB
+                 << " bufB=" << bufB << " uniB=" << uniB
+                 << " repaint=" << (renderTreeParameters.needsRepaint ? 1 : 0)
+                 << " placeChg=" << (renderTreeParameters.placementChanged ? 1 : 0)
+                 << " loaded=" << (renderTreeParameters.loaded ? 1 : 0);
+        Log::Info(Event::Render, perfLine.str());
+    }
 
     observer->onDidFinishRenderingFrame(
         renderTreeParameters.loaded ? RendererObserver::RenderMode::Full : RendererObserver::RenderMode::Partial,

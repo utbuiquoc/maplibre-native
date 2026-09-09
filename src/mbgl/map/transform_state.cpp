@@ -29,7 +29,7 @@ LatLng latLngFromMercator(Point<double> mercatorCoordinate, LatLng::WrapMode wra
             mercatorCoordinate.x * 360.0 - 180.0,
             wrapMode};
 }
-constexpr double kEpsilon = 1e-9;
+constexpr double kEpsilon = 1e-6;
 // To avoid flickering issue due to "zoom = 13.9999999..".
 double roundForAccuracy(double x) {
     double round_x = std::round(x);
@@ -513,7 +513,7 @@ double TransformState::pixel_y() const {
 // MARK: - Zoom
 
 double TransformState::getZoom() const {
-    return scaleZoom(scale);
+    return roundForAccuracy(scaleZoom(scale));
 }
 
 uint8_t TransformState::getIntegerZoom() const {
