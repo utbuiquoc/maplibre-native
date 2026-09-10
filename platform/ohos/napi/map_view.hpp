@@ -22,6 +22,11 @@
 #include <vector>
 
 namespace mbgl {
+
+namespace style {
+class Style;
+}
+
 namespace ohos {
 
 class MapView final : public MapObserver {
@@ -55,6 +60,7 @@ public:
     void beginInteractionZoom();
     void prepareInteractionZoom(double nextZoom);
     void endInteractionZoom();
+    void cancelTransitions();
     void moveBy(double x, double y, AnimationOptions = {});
     void accumulatePan(double x, double y);
     void flushPendingPan();
@@ -70,6 +76,9 @@ public:
     void setPixelRatio(float);
     void setSize(Size);
     void setRepaintCallback(std::function<void()> callback);
+    // heading = nullopt: keep last heading. NaN: hide beam. Finite degrees: show beam.
+    void setUserLocation(double latitude, double longitude, std::optional<double> heading = std::nullopt);
+    void clearUserLocation();
 
     bool hasMap() const { return map != nullptr; }
     OHNativeWindow* getNativeWindow() const { return window; }
@@ -113,6 +122,7 @@ private:
         bool active = false;
         ZoomSessionOwner owner = ZoomSessionOwner::None;
         double pendingDelta = 0.0;
+        double startZoom = 0.0;
         std::chrono::steady_clock::time_point lastEvent{};
     };
 
@@ -174,6 +184,13 @@ private:
     bool lastGpuWaitSampled = false;
     std::function<void()> repaintCallback;
     std::unique_ptr<util::AsyncTask> asyncInvalidate;
+    void updateUserLocationPuck();
+    void ensureUserLocationBeamImage(mbgl::style::Style&);
+    void ensureUserLocationBeamLayer(mbgl::style::Style&);
+    void syncUserLocationBeam(mbgl::style::Style&);
+    std::optional<std::pair<double, double>> currentUserLocation;
+    std::optional<double> currentUserHeading;
+    bool userLocationBeamImageReady = false;
 };
 
 } // namespace ohos

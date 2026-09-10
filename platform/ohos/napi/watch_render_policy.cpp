@@ -1,14 +1,68 @@
 #include "watch_render_policy.hpp"
 
 #include <mbgl/style/layer.hpp>
+#include <mbgl/style/layers/symbol_layer.hpp>
 #include <mbgl/style/style.hpp>
 #include <mbgl/style/types.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <string>
+#include <vector>
 
 namespace mbgl {
 namespace ohos {
+namespace {
+
+void raiseMinZoom(style::Layer* layer, float minZoom) {
+    if (!layer) {
+        return;
+    }
+    if (layer->getMinZoom() < minZoom) {
+        layer->setMinZoom(minZoom);
+    }
+}
+
+// Ladder đường/ngõ: được HẠ minzoom style (VietMap `road_path` = 16 → 14.8).
+void setLayerMinZoom(style::Layer* layer, float minZoom) {
+    if (!layer) {
+        return;
+    }
+    if (layer->getMinZoom() != minZoom) {
+        layer->setMinZoom(minZoom);
+    }
+}
+
+bool idStartsWith(const std::string& id, const char* prefix) {
+    return id.rfind(prefix, 0) == 0;
+}
+
+void collapseSymbolFonts(style::Style& style) {
+    // Six font stacks (Noto + Roboto Regular/Medium/Bold/Italic) × 3 Vietnamese
+    // PBF ranges ≈ 18 HTTP fetches on a cold jump. Collapse to Noto Sans so
+    // the glyph atlas and radio only pay for one Regular + one Bold stack.
+    for (style::Layer* layer : style.getLayers()) {
+        if (!layer || !layer->getTypeInfo() || std::strcmp(layer->getTypeInfo()->type, "symbol") != 0) {
+            continue;
+        }
+        auto* symbol = static_cast<style::SymbolLayer*>(layer);
+        const auto& font = symbol->getTextFont();
+        if (!font.isConstant()) {
+            continue;
+        }
+        bool bold = false;
+        for (const auto& name : font.asConstant()) {
+            if (name.find("Bold") != std::string::npos) {
+                bold = true;
+                break;
+            }
+        }
+        symbol->setTextFont(std::vector<std::string>{bold ? "Noto Sans Bold" : "Noto Sans Regular"});
+    }
+}
+
+} // namespace
 
 void WatchRenderPolicy::applyStyle(style::Style& style) {
     if (auto* extrusion = style.getLayer("building-3d")) {
@@ -45,6 +99,17 @@ void WatchRenderPolicy::applyStyle(style::Style& style) {
         "boundary_2",
         "boundary_3",
         "boundary_disputed",
+        // VietMap: layer trùng / branding / nhãn hành chính dày trên 466px
+        "poiz18_golf_1",
+        "poiz18_vietmap",
+        "boundary_2_label_left",
+        "boundary_2_label_right",
+        "boundary_2_label_left_TQ",
+        "boundary_2_label_right_vn",
+        "boundary_district_left",
+        "boundary_district_right",
+        "boundary_province_left",
+        "boundary_province_right",
     };
     for (const char* id : permanentlyHiddenLayers) {
         if (auto* layer = style.getLayer(id)) {
@@ -52,15 +117,42 @@ void WatchRenderPolicy::applyStyle(style::Style& style) {
         }
     }
 
-    // Nhãn sông suối nhỏ: chỉ hiện khi zoom xa (giữ water fill + tên sông lớn).
+    // Nhãn sông suối nhỏ: chỉ hiện khi zoom gần (giữ water fill + tên sông lớn).
+    // SEA Map Dark dùng `waterway_name` / `water_point`; OpenFreeMap dùng `*_line_label`.
     constexpr const char* farOnlyLabels[] = {
         "water_name_line_label",
         "waterway_line_label",
         "waterway_name",
+        "water_point",
     };
     for (const char* id : farOnlyLabels) {
-        if (auto* layer = style.getLayer(id)) {
-            layer->setMinZoom(12.0f);
+        raiseMinZoom(style.getLayer(id), 12.0f);
+    }
+
+    // Prefix ladder cho toàn bộ POI VietMap (poiz18_cinema minzoom style = 13,
+    // poiz16_education = 13, poiz18_vietmap = 11 — không nằm trong danh sách
+    // ID cứng bên dưới). Chỉ nâng, không hạ minzoom style.
+    for (style::Layer* layer : style.getLayers()) {
+        if (!layer) {
+            continue;
+        }
+        const std::string id = layer->getID();
+        if (idStartsWith(id, "poiz18_")) {
+            raiseMinZoom(layer, 16.5f);
+        } else if (idStartsWith(id, "poiz16_")) {
+            raiseMinZoom(layer, 16.0f);
+        } else if (idStartsWith(id, "poiz15_")) {
+            raiseMinZoom(layer, 15.5f);
+        } else if (idStartsWith(id, "poiz14_")) {
+            raiseMinZoom(layer, 15.2f);
+        } else if (idStartsWith(id, "poiz13_")) {
+            raiseMinZoom(layer, 15.0f);
+        } else if (idStartsWith(id, "poiz12_")) {
+            raiseMinZoom(layer, 14.0f);
+        } else if (idStartsWith(id, "poiz11_")) {
+            raiseMinZoom(layer, 13.5f);
+        } else if (idStartsWith(id, "poiz9_")) {
+            raiseMinZoom(layer, 12.0f);
         }
     }
 
@@ -85,6 +177,10 @@ void WatchRenderPolicy::applyStyle(style::Style& style) {
         {"tunnel_tertiary", 12.0f},
         {"bridge_tertiary", 12.0f},
         {"road_tertiary_label", 13.0f},
+        {"road_primary_label", 12.8f},
+        {"road_trunk_label", 12.5f},
+        {"road_motorway_label", 12.0f},
+        {"road_ferry_label", 12.0f},
         {"highway-name-major", 13.0f},
 
         // --- ZOOM 14.0: Đường sắt ---
@@ -236,10 +332,10 @@ void WatchRenderPolicy::applyStyle(style::Style& style) {
         {"poi_r20", 16.5f},
     };
     for (const auto& entry : zoomLadder) {
-        if (auto* layer = style.getLayer(entry.id)) {
-            layer->setMinZoom(entry.minZoom);
-        }
+        setLayerMinZoom(style.getLayer(entry.id), entry.minZoom);
     }
+
+    collapseSymbolFonts(style);
 }
 
 double WatchRenderPolicy::coveringShift(double cameraZoom) {

@@ -613,6 +613,16 @@ public:
         renderFrame();
     }
 
+    void cancelTransitions() {
+        if (closed) {
+            return;
+        }
+        if (mapView) {
+            mapView->cancelTransitions();
+            armRenderPump();
+        }
+    }
+
     void zoomBy(double deltaZoom) {
         if (closed) {
             return;
@@ -621,6 +631,28 @@ public:
         ensureMapView().addZoomDelta(deltaZoom);
         armRenderPump();
         renderFrameThrottled();
+    }
+
+    void setUserLocation(double latitude, double longitude, std::optional<double> heading = std::nullopt) {
+        if (closed) {
+            return;
+        }
+
+        ensureMapView().setUserLocation(latitude, longitude, heading);
+        armRenderPump();
+        renderFrame();
+    }
+
+    void clearUserLocation() {
+        if (closed) {
+            return;
+        }
+
+        if (mapView) {
+            mapView->clearUserLocation();
+            armRenderPump();
+            renderFrame();
+        }
     }
 
     void setPixelRatio(float newPixelRatio) {
@@ -1326,6 +1358,7 @@ napi_value renderFrame(napi_env env, napi_callback_info info);
 napi_value reduceMemoryUse(napi_env env, napi_callback_info info);
 napi_value setStyleUrl(napi_env env, napi_callback_info info);
 napi_value jumpTo(napi_env env, napi_callback_info info);
+napi_value cancelTransitions(napi_env env, napi_callback_info info);
 napi_value zoomBy(napi_env env, napi_callback_info info);
 napi_value setPixelRatio(napi_env env, napi_callback_info info);
 napi_value setBounds(napi_env env, napi_callback_info info);
@@ -1339,6 +1372,8 @@ napi_value getStyleAttributions(napi_env env, napi_callback_info info);
 napi_value getSurfaceState(napi_env env, napi_callback_info info);
 napi_value getCameraOptions(napi_env env, napi_callback_info info);
 napi_value isInteractive(napi_env env, napi_callback_info info);
+napi_value setUserLocation(napi_env env, napi_callback_info info);
+napi_value clearUserLocation(napi_env env, napi_callback_info info);
 
 ControllerHandle resolveController(napi_env env, napi_value thisArg) {
     void* nativeController = nullptr;
@@ -1375,6 +1410,7 @@ const napi_property_descriptor* contextProperties(std::size_t& count) {
         {"getSurfaceState", nullptr, getSurfaceState, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"isInteractive", nullptr, isInteractive, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"jumpTo", nullptr, jumpTo, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"cancelTransitions", nullptr, cancelTransitions, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"zoomBy", nullptr, zoomBy, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"reduceMemoryUse", nullptr, reduceMemoryUse, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"renderFrame", nullptr, renderFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -1386,6 +1422,8 @@ const napi_property_descriptor* contextProperties(std::size_t& count) {
         {"setResourceOptions", nullptr, setResourceOptions, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setTileCacheEnabled", nullptr, setTileCacheEnabled, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setStyleUrl", nullptr, setStyleUrl, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setUserLocation", nullptr, setUserLocation, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"clearUserLocation", nullptr, clearUserLocation, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     count = sizeof(properties) / sizeof(properties[0]);
     return properties;
@@ -1522,6 +1560,25 @@ napi_value jumpTo(napi_env env, napi_callback_info info) {
 
     try {
         controller->jumpTo(std::move(cameraOptions));
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+    return getUndefined(env);
+}
+
+napi_value cancelTransitions(napi_env env, napi_callback_info info) {
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, nullptr, nullptr, &thisArg, nullptr) != napi_ok) {
+        return throwError(env, "Could not get callback info");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    try {
+        controller->cancelTransitions();
     } catch (const std::exception& exception) {
         return throwError(env, exception.what());
     }
@@ -2019,6 +2076,61 @@ napi_value onHttpResponse(napi_env env, napi_callback_info info) {
         }
     });
 
+    return getUndefined(env);
+}
+
+napi_value setUserLocation(napi_env env, napi_callback_info info) {
+    std::size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 2 || argv[0] == nullptr || argv[1] == nullptr) {
+        return throwError(env, "Expected latitude and longitude");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    double lat = 0.0;
+    double lng = 0.0;
+    if (!getDouble(env, argv[0], lat) || !getDouble(env, argv[1], lng) || !std::isfinite(lat) || !std::isfinite(lng)) {
+        return throwError(env, "Expected finite latitude and longitude");
+    }
+
+    std::optional<double> heading;
+    if (argc >= 3 && argv[2] != nullptr && !isNullOrUndefined(env, argv[2])) {
+        double headingValue = 0.0;
+        if (!getDouble(env, argv[2], headingValue)) {
+            return throwError(env, "Expected heading number in degrees");
+        }
+        heading = headingValue;
+    }
+
+    try {
+        controller->setUserLocation(lat, lng, heading);
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+    return getUndefined(env);
+}
+
+napi_value clearUserLocation(napi_env env, napi_callback_info info) {
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, nullptr, nullptr, &thisArg, nullptr) != napi_ok) {
+        return getUndefined(env);
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    try {
+        controller->clearUserLocation();
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
     return getUndefined(env);
 }
 

@@ -11,8 +11,15 @@ class Style;
 namespace ohos {
 
 struct WatchRenderPolicy {
-    static constexpr double minZoom = 0.0;
-    static constexpr double maxZoom = 18.0;
+    // z5 ≈ 11°/tile: cả Việt Nam + biên vừa một mặt 466px. z0 cho phép quả
+    // đất + wrap ±3 bản sao thế giới → parse/OOM khi vặn crown zoom out.
+    static constexpr double minZoom = 5.0;
+    // 09/2026: 18 → 20 cho MỌI đường zoom (transform bounds lúc tạo map +
+    // applyPendingZoomDelta). Tile vẫn tới z15 → z16-20 là overzoom (xem AGENTS.md).
+    static constexpr double maxZoom = 20.0;
+    // Default MapLibre = 3 (pitched 3D). Màn watch 466px / tile 512px chỉ
+    // cần bán kính 1; radius 3 lúc zoom out xin vòng tile ngoài viewport.
+    static constexpr double tileLodMinRadius = 1.0;
     // Trần zoom phủ (tile LOD cap). 09/2026: basemap chính là VietMap Tilemap
     // vector (style "SEA Map Dark", source openmaptiles maxzoom 15) khi có
     // VIETMAP_TILE_KEY; fallback OpenFreeMap khi key rỗng (source maxzoom 14,

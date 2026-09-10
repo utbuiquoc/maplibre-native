@@ -101,9 +101,15 @@ std::optional<TouchPoint> touchPointForEvent(const TouchEvent& event, std::optio
     }
 
     for (const auto& point : event.points) {
-        if (!activeId || point.id == *activeId) {
+        if (point.id == *activeId) {
             return point;
         }
+    }
+
+    // Resilient fallback: if active pointer ID is not found (e.g. multi-finger transition,
+    // pointer reassignment), adopt the primary available point rather than dropping gesture events.
+    if (!event.points.empty()) {
+        return event.points.front();
     }
 
     return std::nullopt;
@@ -208,6 +214,10 @@ bool handleTouchAction(GestureState& state,
 
     switch (action) {
         case TouchAction::Down: {
+            if (mapView) {
+                mapView->cancelTransitions();
+                mapView->setGestureInProgress(true);
+            }
             if (pinch) {
                 beginPinch();
                 return true;
@@ -228,9 +238,6 @@ bool handleTouchAction(GestureState& state,
             state.touchSampleTime = state.tapStartTime;
             state.touchVelocityX = 0.0;
             state.touchVelocityY = 0.0;
-            if (mapView) {
-                mapView->setGestureInProgress(true);
-            }
             needsRender = true;
             break;
         }
@@ -277,24 +284,61 @@ bool handleTouchAction(GestureState& state,
                 mapView->moveBy(dx, dy);
                 return true;
             }
+
+            // Pinch ended because second finger lifted: recover gracefully to single-finger pan
             if (state.pinchActive) {
+                state.pinchActive = false;
+                state.shoveActive = false;
+                state.touchActive = true;
+                if (point) {
+                    state.touchId = point->id;
+                    state.touchX = point->x;
+                    state.touchY = point->y;
+                    state.touchSampleTime = std::chrono::steady_clock::now();
+                    state.touchVelocityX = 0.0;
+                    state.touchVelocityY = 0.0;
+                }
                 return false;
             }
-            if (!state.touchActive || hasMultiplePoints) {
+
+            if (hasMultiplePoints) {
                 return false;
             }
+
+            // Recover touchActive if Down event was missed
+            if (!state.touchActive) {
+                if (!point) {
+                    return false;
+                }
+                state.touchActive = true;
+                state.touchId = point->id;
+                state.touchX = point->x;
+                state.touchY = point->y;
+                state.tapCandidate = false;
+                state.touchSampleTime = std::chrono::steady_clock::now();
+                state.touchVelocityX = 0.0;
+                state.touchVelocityY = 0.0;
+                return false;
+            }
+
             if (!point || !mapView) {
                 return false;
             }
+
+            state.touchId = point->id;
+
             const auto now = std::chrono::steady_clock::now();
             const double dx = point->x - state.touchX;
             const double dy = point->y - state.touchY;
             state.touchX = point->x;
             state.touchY = point->y;
             const auto elapsed = std::chrono::duration<double>(now - state.touchSampleTime).count();
-            if (elapsed > 0.0) {
-                state.touchVelocityX = dx / elapsed;
-                state.touchVelocityY = dy / elapsed;
+            // Reject micro-intervals (< 8ms) to prevent velocity explosion during batch touch events / frame hitches
+            if (elapsed >= 0.008) {
+                const double instantVx = dx / elapsed;
+                const double instantVy = dy / elapsed;
+                state.touchVelocityX = state.touchVelocityX * 0.35 + instantVx * 0.65;
+                state.touchVelocityY = state.touchVelocityY * 0.35 + instantVy * 0.65;
                 state.touchSampleTime = now;
             }
             if (distanceBetween(point->x, point->y, state.tapStartX, state.tapStartY) > MaxTapMovement) {
@@ -302,19 +346,42 @@ bool handleTouchAction(GestureState& state,
             }
             // Coalesce: accumulate here, apply once per pump tick in
             // MapView::pumpEvents (driven by DisplaySync/watchdog, not by input).
-            // Velocity sampling above stays per-event so fling keeps the true
-            // release speed.
             mapView->accumulatePan(dx, dy);
             needsRender = true;
             break;
         }
         case TouchAction::Up:
         case TouchAction::Cancel: {
-            const bool canHandleTap = action == TouchAction::Up && !state.pinchActive && point;
-            const double velocity = mapView ? normalizedFlingVelocity(
-                                                  state.touchVelocityX, state.touchVelocityY, mapView->getPixelRatio())
-                                            : 0.0;
-            const bool shouldFling = action == TouchAction::Up && !state.tapCandidate && !state.pinchActive &&
+            if (action == TouchAction::Cancel) {
+                state.touchActive = false;
+                state.pinchActive = false;
+                state.shoveActive = false;
+                state.tapCandidate = false;
+                state.touchVelocityX = 0.0;
+                state.touchVelocityY = 0.0;
+                if (mapView) {
+                    mapView->cancelTransitions();
+                    mapView->setGestureInProgress(false);
+                    mapView->endInteractionZoom();
+                }
+                needsRender = true;
+                break;
+            }
+
+            const bool canHandleTap = !state.pinchActive && point;
+            double velocity = mapView ? normalizedFlingVelocity(
+                                            state.touchVelocityX, state.touchVelocityY, mapView->getPixelRatio())
+                                      : 0.0;
+            // Cap fling velocity to avoid launching camera into astronomical unrendered space
+            constexpr double MaxFlingVelocity = 2400.0;
+            if (velocity > MaxFlingVelocity) {
+                const double scale = MaxFlingVelocity / velocity;
+                state.touchVelocityX *= scale;
+                state.touchVelocityY *= scale;
+                velocity = MaxFlingVelocity;
+            }
+
+            const bool shouldFling = !state.tapCandidate && !state.pinchActive &&
                                      std::isfinite(velocity) && velocity >= MinFlingVelocity;
             state.touchActive = false;
             state.pinchActive = false;
@@ -323,24 +390,32 @@ bool handleTouchAction(GestureState& state,
                 // Apply any coalesced pan first so the fling animation starts
                 // from the true finger position, not one tick behind.
                 mapView->flushPendingPan();
-                // Finger is up. MapView::syncGestureFlag keeps MapLibre's
-                // gestureInProgress set while isPanning/isScaling (fling,
-                // double-tap fly) so symbol placement stays deferred.
-                mapView->setGestureInProgress(false);
                 mapView->endInteractionZoom();
                 if (!canHandleTap || !handleTap(*point)) {
                     if (shouldFling) {
                         const double pitch = mapView->getCameraOptions().pitch.value_or(0.0);
-                        const auto duration = flingAnimationDuration(velocity, pitch);
+                        auto duration = flingAnimationDuration(velocity, pitch);
+                        // Cap fling animation duration to wearable maximum (350ms)
+                        constexpr std::chrono::milliseconds MaxFlingDuration{350};
+                        if (duration > MaxFlingDuration) {
+                            duration = MaxFlingDuration;
+                        }
                         const double durationSeconds = std::chrono::duration<double>(duration).count();
                         const auto surfaceSize = mapView->getSurfaceSize();
                         const double offsetX = state.touchVelocityX * durationSeconds * FlingOffsetFactor;
                         const double offsetY = state.touchVelocityY * durationSeconds * FlingOffsetFactor;
+                        // Keep gestureInProgress true during fling invocation so Transform::easeTo
+                        // does not convert the moveBy animation into a flyTo parabolic flight curve!
                         mapView->moveBy(clampHorizontalFlingOffset(offsetX, surfaceSize),
                                         clampVerticalFlingOffset(offsetY, surfaceSize, pitch),
                                         mbgl::AnimationOptions{duration});
+                    } else {
+                        mapView->cancelTransitions();
                     }
+                    mapView->setGestureInProgress(false);
                     needsRender = true;
+                } else {
+                    mapView->setGestureInProgress(false);
                 }
             }
             state.tapCandidate = false;

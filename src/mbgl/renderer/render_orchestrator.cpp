@@ -20,6 +20,7 @@
 #include <mbgl/renderer/query.hpp>
 #include <mbgl/renderer/image_manager.hpp>
 #include <mbgl/geometry/line_atlas.hpp>
+#include <mbgl/style/layer_properties.hpp>
 #include <mbgl/style/source_impl.hpp>
 #include <mbgl/style/transition_options.hpp>
 #include <mbgl/text/glyph_manager.hpp>
@@ -30,6 +31,7 @@
 #include <mbgl/util/logging.hpp>
 
 #include <algorithm>
+#include <string>
 
 namespace mbgl {
 
@@ -386,14 +388,12 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
                     sourceNeedsRelayout = (sourceNeedsRelayout || hasImageDiff ||
                                            constantsMaskChanged.contains(layerId) ||
                                            hasLayoutDifference(layerDiff, layerId));
-                    if (layerIsVisible) {
+                    if (layerIsVisible && zoomFitsLayer) {
                         filteredLayersForSource.push_back(layer.evaluatedProperties);
-                        if (zoomFitsLayer) {
-                            sourceNeedsRendering = true;
-                            renderItemsEmplaceHint = layerRenderItems.emplace_hint(
-                                renderItemsEmplaceHint, layer, source, static_cast<uint32_t>(index));
-                            updateList[index] = true;
-                        }
+                        sourceNeedsRendering = true;
+                        renderItemsEmplaceHint = layerRenderItems.emplace_hint(
+                            renderItemsEmplaceHint, layer, source, static_cast<uint32_t>(index));
+                        updateList[index] = true;
                     }
                 }
                 continue;
@@ -415,6 +415,27 @@ std::unique_ptr<RenderTree> RenderOrchestrator::createRenderTree(
             }
         }
         tileParameters.isUpdateSynchronous = sourceImpl->isUpdateSynchronous();
+        // Relayout when the zoom-filtered layer set changes (e.g. crossing
+        // poiz16 minzoom). Passing only zoom-fitting layers keeps symbol
+        // layout / glyph deps proportional to what is on screen.
+        std::string layoutKey;
+        layoutKey.reserve(filteredLayersForSource.size() * 16);
+        for (const auto& props : filteredLayersForSource) {
+            layoutKey += props->baseImpl->id;
+            layoutKey += '\n';
+        }
+        auto& lastKey = lastFilteredLayerKeys[sourceImpl->id];
+        if (layoutKey != lastKey) {
+            // Zoom in (thêm layer, vd. road_path 14.8): PHẢI relayout ngay —
+            // covering cap z15 nên không tạo tile mới, ngõ/hẻm chỉ hiện sau
+            // setLayers. Zoom out (bớt layer): hoãn lúc gesture để tránh
+            // parse storm; hết gesture thì key vẫn khác → relayout 1 lần.
+            const bool layerSetGrew = layoutKey.size() > lastKey.size();
+            if (layerSetGrew || !updateParameters->transformState.isGestureInProgress()) {
+                sourceNeedsRelayout = true;
+                lastKey = std::move(layoutKey);
+            }
+        }
         source->update(sourceImpl, filteredLayersForSource, sourceNeedsRendering, sourceNeedsRelayout, tileParameters);
         filteredLayersForSource.clear();
 
