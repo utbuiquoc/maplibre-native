@@ -52,6 +52,28 @@ struct WatchRenderPolicy {
     // mức zoom khác, chỉ ổn định vùng biên.
     static constexpr double coveringEpsilon = 1e-3;
 
+    // ---- Dẫn đường (tuyến vẽ trong mbgl) ----
+    // Lưu ý đơn vị: line rộng tính bằng pixel màn hình (screen-space) nên không đổi theo
+    // zoom; màu ở đây là RGBA float. Tuyến nằm TRONG GL surface (không phải overlay ArkUI)
+    // nên alpha hợp lệ — khác directive "nền nút phải đục" của repo app.
+    static constexpr float routeCasingWidth = 9.0f;
+    static constexpr float routeLineWidth = 6.0f;
+    // Casing tối để tuyến nổi trên nền "SEA Map Dark".
+    static constexpr float routeCasingR = 0.04f;
+    static constexpr float routeCasingG = 0.09f;
+    static constexpr float routeCasingB = 0.14f;
+    static constexpr float routeCasingA = 0.85f;
+    // #1A73E8 — trùng màu puck để nhất quán.
+    static constexpr float routeLineR = 0.10f;
+    static constexpr float routeLineG = 0.45f;
+    static constexpr float routeLineB = 0.91f;
+    static constexpr float routeLineA = 1.0f;
+    // Phần đã đi qua: xám, vẫn đục để không bị nhầm với nền.
+    static constexpr float routeTravelledR = 0.55f;
+    static constexpr float routeTravelledG = 0.60f;
+    static constexpr float routeTravelledB = 0.66f;
+    static constexpr float routeTravelledA = 1.0f;
+
     static void applyStyle(style::Style&);
     static double coveringShift(double cameraZoom);
 };

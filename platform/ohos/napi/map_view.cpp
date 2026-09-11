@@ -12,6 +12,7 @@
 #include <mbgl/style/expression/image.hpp>
 #include <mbgl/style/image.hpp>
 #include <mbgl/style/layers/circle_layer.hpp>
+#include <mbgl/style/layers/line_layer.hpp>
 #include <mbgl/style/layers/symbol_layer.hpp>
 #include <mbgl/style/source.hpp>
 #include <mbgl/style/sources/geojson_source.hpp>
@@ -69,6 +70,13 @@ constexpr const char* kUserLocationHalo = "user_location_halo";
 constexpr const char* kUserLocationBeam = "user_location_beam";
 constexpr const char* kUserLocationBeamImage = "user_location_beam_image";
 constexpr float kBeamIconSize = 0.56f;
+// Tuyến dẫn đường: 2 source (đã đi / còn lại) + 3 layer (casing, line, travelled).
+// Dùng 2 source thay vì filter để tránh phụ thuộc API expression của mbgl.
+constexpr const char* kRouteRemainingSource = "nav_route_remaining_source";
+constexpr const char* kRouteTravelledSource = "nav_route_travelled_source";
+constexpr const char* kRouteCasingLayer = "nav_route_casing";
+constexpr const char* kRouteLineLayer = "nav_route_line";
+constexpr const char* kRouteTravelledLayer = "nav_route_travelled";
 
 double normalizeHeadingDegrees(double heading) {
     double wrapped = std::fmod(heading, 360.0);
@@ -891,6 +899,21 @@ void MapView::onDidFinishLoadingStyle() {
     if (currentUserLocation.has_value()) {
         updateUserLocationPuck();
     }
+    // Style reload xoá sạch source/layer ⇒ phải vẽ lại tuyến đang dẫn đường (gate A6:
+    // reloadStyle giữa phiên vẫn phải thấy tuyến).
+    if (!routeCoords.empty()) {
+        try {
+            ensureRouteLayers(map->getStyle());
+            applyRouteGeoJSON(map->getStyle());
+            if (repaintCallback) {
+                repaintCallback();
+            }
+        } catch (const std::exception& exception) {
+            Log::Warning(Event::General, std::string("route re-apply after style failed: ") + exception.what());
+        } catch (...) {
+            Log::Warning(Event::General, "route re-apply after style failed");
+        }
+    }
     try {
         const auto defaultCamera = map->getStyle().getDefaultCamera();
         if (!desiredCamera && !desiredCameraBounds && !desiredFreeCamera && defaultCamera.center &&
@@ -984,6 +1007,173 @@ void MapView::clearUserLocation() {
             // best-effort cleanup
         }
     }
+}
+
+void MapView::setRoute(const std::vector<double>& lonLat) {
+    routeCoords.clear();
+    const std::size_t count = lonLat.size() / 2;
+    routeCoords.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const double lng = lonLat[i * 2];
+        const double lat = lonLat[i * 2 + 1];
+        if (std::isfinite(lng) && std::isfinite(lat)) {
+            routeCoords.emplace_back(lng, lat);
+        }
+    }
+    routeTravelledIndex = 0;
+    if (!map || !styleLoaded || routeCoords.size() < 2) {
+        // Chưa có style ⇒ để onDidFinishLoadingStyle vẽ; tuyến < 2 điểm không phải LineString.
+        return;
+    }
+    try {
+        auto& style = map->getStyle();
+        ensureRouteLayers(style);
+        applyRouteGeoJSON(style);
+        if (repaintCallback) {
+            repaintCallback();
+        }
+    } catch (const std::exception& exception) {
+        Log::Warning(Event::General, std::string("setRoute failed: ") + exception.what());
+    } catch (...) {
+        Log::Warning(Event::General, "setRoute failed");
+    }
+}
+
+void MapView::setRouteProgress(std::size_t travelledIndex) {
+    if (routeCoords.empty()) {
+        return;
+    }
+    const std::size_t maxIndex = routeCoords.size() - 1;
+    const std::size_t clamped = travelledIndex > maxIndex ? maxIndex : travelledIndex;
+    if (clamped == routeTravelledIndex) {
+        return;
+    }
+    routeTravelledIndex = clamped;
+    if (!map || !styleLoaded) {
+        return;
+    }
+    try {
+        applyRouteGeoJSON(map->getStyle());
+        if (repaintCallback) {
+            repaintCallback();
+        }
+    } catch (const std::exception& exception) {
+        Log::Warning(Event::General, std::string("setRouteProgress failed: ") + exception.what());
+    } catch (...) {
+        Log::Warning(Event::General, "setRouteProgress failed");
+    }
+}
+
+void MapView::clearRoute() {
+    routeCoords.clear();
+    routeTravelledIndex = 0;
+    if (!map || !styleLoaded) {
+        return;
+    }
+    try {
+        auto& style = map->getStyle();
+        if (style.getLayer(kRouteCasingLayer)) {
+            style.removeLayer(kRouteCasingLayer);
+        }
+        if (style.getLayer(kRouteLineLayer)) {
+            style.removeLayer(kRouteLineLayer);
+        }
+        if (style.getLayer(kRouteTravelledLayer)) {
+            style.removeLayer(kRouteTravelledLayer);
+        }
+        if (style.getSource(kRouteRemainingSource)) {
+            style.removeSource(kRouteRemainingSource);
+        }
+        if (style.getSource(kRouteTravelledSource)) {
+            style.removeSource(kRouteTravelledSource);
+        }
+        if (repaintCallback) {
+            repaintCallback();
+        }
+    } catch (const std::exception& exception) {
+        Log::Warning(Event::General, std::string("clearRoute failed: ") + exception.what());
+    } catch (...) {
+        Log::Warning(Event::General, "clearRoute failed");
+    }
+}
+
+/**
+ * Chèn layer trước lớp symbol ĐẦU TIÊN để nhãn đường luôn nằm trên tuyến. Style chưa có
+ * symbol layer ⇒ trả nullopt và layer được thêm lên trên cùng (không còn cách nào tốt hơn).
+ */
+std::optional<std::string> MapView::firstSymbolLayerId(mbgl::style::Style& style) const {
+    for (auto* layer : style.getLayers()) {
+        if (!layer || !layer->getTypeInfo()) {
+            continue;
+        }
+        if (std::strcmp(layer->getTypeInfo()->type, "symbol") == 0) {
+            return layer->getID();
+        }
+    }
+    return std::nullopt;
+}
+
+void MapView::ensureRouteLayers(mbgl::style::Style& style) {
+    if (!style.getSource(kRouteRemainingSource)) {
+        style.addSource(std::make_unique<mbgl::style::GeoJSONSource>(kRouteRemainingSource));
+    }
+    if (!style.getSource(kRouteTravelledSource)) {
+        style.addSource(std::make_unique<mbgl::style::GeoJSONSource>(kRouteTravelledSource));
+    }
+    const std::optional<std::string> before = firstSymbolLayerId(style);
+
+    if (!style.getLayer(kRouteCasingLayer)) {
+        auto casing = std::make_unique<mbgl::style::LineLayer>(kRouteCasingLayer, kRouteRemainingSource);
+        casing->setLineCap(mbgl::style::LineCapType::Round);
+        casing->setLineJoin(mbgl::style::LineJoinType::Round);
+        casing->setLineWidth(WatchRenderPolicy::routeCasingWidth);
+        casing->setLineColor(mbgl::Color(WatchRenderPolicy::routeCasingR, WatchRenderPolicy::routeCasingG,
+            WatchRenderPolicy::routeCasingB, WatchRenderPolicy::routeCasingA));
+        style.addLayer(std::move(casing), before);
+    }
+    if (!style.getLayer(kRouteLineLayer)) {
+        auto line = std::make_unique<mbgl::style::LineLayer>(kRouteLineLayer, kRouteRemainingSource);
+        line->setLineCap(mbgl::style::LineCapType::Round);
+        line->setLineJoin(mbgl::style::LineJoinType::Round);
+        line->setLineWidth(WatchRenderPolicy::routeLineWidth);
+        line->setLineColor(mbgl::Color(WatchRenderPolicy::routeLineR, WatchRenderPolicy::routeLineG,
+            WatchRenderPolicy::routeLineB, WatchRenderPolicy::routeLineA));
+        style.addLayer(std::move(line), before);
+    }
+    if (!style.getLayer(kRouteTravelledLayer)) {
+        auto travelled = std::make_unique<mbgl::style::LineLayer>(kRouteTravelledLayer, kRouteTravelledSource);
+        travelled->setLineCap(mbgl::style::LineCapType::Round);
+        travelled->setLineJoin(mbgl::style::LineJoinType::Round);
+        travelled->setLineWidth(WatchRenderPolicy::routeLineWidth);
+        travelled->setLineColor(mbgl::Color(WatchRenderPolicy::routeTravelledR, WatchRenderPolicy::routeTravelledG,
+            WatchRenderPolicy::routeTravelledB, WatchRenderPolicy::routeTravelledA));
+        style.addLayer(std::move(travelled), before);
+    }
+}
+
+void MapView::applyRouteGeoJSON(mbgl::style::Style& style) {
+    auto* remaining = static_cast<mbgl::style::GeoJSONSource*>(style.getSource(kRouteRemainingSource));
+    auto* travelled = static_cast<mbgl::style::GeoJSONSource*>(style.getSource(kRouteTravelledSource));
+    if (!remaining || !travelled) {
+        return;
+    }
+    const std::size_t maxIndex = routeCoords.size() > 0 ? routeCoords.size() - 1 : 0;
+    const std::size_t split = routeTravelledIndex > maxIndex ? maxIndex : routeTravelledIndex;
+
+    mbgl::LineString<double> travelledLine;
+    if (split >= 1) {
+        for (std::size_t i = 0; i <= split; ++i) {
+            travelledLine.emplace_back(routeCoords[i].first, routeCoords[i].second);
+        }
+    }
+    mbgl::LineString<double> remainingLine;
+    if (routeCoords.size() >= 2 && split < routeCoords.size()) {
+        for (std::size_t i = split; i < routeCoords.size(); ++i) {
+            remainingLine.emplace_back(routeCoords[i].first, routeCoords[i].second);
+        }
+    }
+    travelled->setGeoJSON(mbgl::Geometry<double>{travelledLine});
+    remaining->setGeoJSON(mbgl::Geometry<double>{remainingLine});
 }
 
 void MapView::ensureUserLocationBeamImage(mbgl::style::Style& style) {

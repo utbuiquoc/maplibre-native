@@ -655,6 +655,40 @@ public:
         }
     }
 
+    void setRoute(const std::vector<double>& lonLat) {
+        if (closed) {
+            return;
+        }
+
+        ensureMapView().setRoute(lonLat);
+        armRenderPump();
+        renderFrame();
+    }
+
+    void setRouteProgress(std::size_t travelledIndex) {
+        if (closed) {
+            return;
+        }
+
+        if (mapView) {
+            mapView->setRouteProgress(travelledIndex);
+            armRenderPump();
+            renderFrame();
+        }
+    }
+
+    void clearRoute() {
+        if (closed) {
+            return;
+        }
+
+        if (mapView) {
+            mapView->clearRoute();
+            armRenderPump();
+            renderFrame();
+        }
+    }
+
     void setPixelRatio(float newPixelRatio) {
         if (closed) {
             return;
@@ -1374,6 +1408,9 @@ napi_value getCameraOptions(napi_env env, napi_callback_info info);
 napi_value isInteractive(napi_env env, napi_callback_info info);
 napi_value setUserLocation(napi_env env, napi_callback_info info);
 napi_value clearUserLocation(napi_env env, napi_callback_info info);
+napi_value setRoute(napi_env env, napi_callback_info info);
+napi_value setRouteProgress(napi_env env, napi_callback_info info);
+napi_value clearRoute(napi_env env, napi_callback_info info);
 
 ControllerHandle resolveController(napi_env env, napi_value thisArg) {
     void* nativeController = nullptr;
@@ -1424,6 +1461,9 @@ const napi_property_descriptor* contextProperties(std::size_t& count) {
         {"setStyleUrl", nullptr, setStyleUrl, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setUserLocation", nullptr, setUserLocation, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"clearUserLocation", nullptr, clearUserLocation, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setRoute", nullptr, setRoute, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setRouteProgress", nullptr, setRouteProgress, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"clearRoute", nullptr, clearRoute, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     count = sizeof(properties) / sizeof(properties[0]);
     return properties;
@@ -2128,6 +2168,103 @@ napi_value clearUserLocation(napi_env env, napi_callback_info info) {
 
     try {
         controller->clearUserLocation();
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+    return getUndefined(env);
+}
+
+/** Đọc mảng số phẳng của JS ([lon, lat, ...]) — rẻ hơn mảng object cho tuyến 1000+ điểm. */
+bool getDoubleArray(napi_env env, napi_value value, std::vector<double>& out) {
+    bool isArray = false;
+    if (napi_is_array(env, value, &isArray) != napi_ok || !isArray) {
+        return false;
+    }
+    std::uint32_t length = 0;
+    if (napi_get_array_length(env, value, &length) != napi_ok) {
+        return false;
+    }
+    out.clear();
+    out.reserve(length);
+    for (std::uint32_t i = 0; i < length; ++i) {
+        napi_value element = nullptr;
+        if (napi_get_element(env, value, i, &element) != napi_ok || element == nullptr) {
+            return false;
+        }
+        double number = 0.0;
+        if (!getDouble(env, element, number) || !std::isfinite(number)) {
+            return false;
+        }
+        out.push_back(number);
+    }
+    return true;
+}
+
+napi_value setRoute(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected a flat [lon, lat, ...] number array");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    std::vector<double> lonLat;
+    if (!getDoubleArray(env, argv[0], lonLat)) {
+        return throwError(env, "Expected a flat [lon, lat, ...] finite number array");
+    }
+
+    try {
+        controller->setRoute(lonLat);
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+    return getUndefined(env);
+}
+
+napi_value setRouteProgress(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+        return throwError(env, "Expected a travelled vertex index");
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    double indexValue = 0.0;
+    if (!getDouble(env, argv[0], indexValue) || !std::isfinite(indexValue) || indexValue < 0.0) {
+        return throwError(env, "Expected a finite travelled vertex index >= 0");
+    }
+
+    try {
+        controller->setRouteProgress(static_cast<std::size_t>(indexValue));
+    } catch (const std::exception& exception) {
+        return throwError(env, exception.what());
+    }
+    return getUndefined(env);
+}
+
+napi_value clearRoute(napi_env env, napi_callback_info info) {
+    napi_value thisArg = nullptr;
+    if (napi_get_cb_info(env, info, nullptr, nullptr, &thisArg, nullptr) != napi_ok) {
+        return getUndefined(env);
+    }
+
+    auto controller = resolveController(env, thisArg);
+    if (!controller) {
+        return getUndefined(env);
+    }
+
+    try {
+        controller->clearRoute();
     } catch (const std::exception& exception) {
         return throwError(env, exception.what());
     }
