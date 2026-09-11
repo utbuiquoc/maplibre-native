@@ -232,6 +232,10 @@ private:
     // Vectors with reserved capacity of layerImpls->size() to avoid
     // reallocation on each frame.
     std::vector<Immutable<style::LayerProperties>> filteredLayersForSource;
+    // Layer-id signature last sent to each source. When zoom crosses a
+    // minzoom boundary the set changes and tiles must relayout — otherwise
+    // GeometryTileWorker keeps laying out poiz18_* (minzoom 18) at z14.
+    std::unordered_map<std::string, std::string> lastFilteredLayerKeys;
     RenderLayerReferences orderedLayers;
     RenderLayerReferences layersNeedPlacement;
 

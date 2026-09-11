@@ -14,14 +14,21 @@
 #include <native_window/external_window.h>
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace mbgl {
+
+namespace style {
+class Style;
+}
+
 namespace ohos {
 
 class MapView final : public MapObserver {
@@ -55,6 +62,7 @@ public:
     void beginInteractionZoom();
     void prepareInteractionZoom(double nextZoom);
     void endInteractionZoom();
+    void cancelTransitions();
     void moveBy(double x, double y, AnimationOptions = {});
     void accumulatePan(double x, double y);
     void flushPendingPan();
@@ -70,6 +78,16 @@ public:
     void setPixelRatio(float);
     void setSize(Size);
     void setRepaintCallback(std::function<void()> callback);
+    // heading = nullopt: keep last heading. NaN: hide beam. Finite degrees: show beam.
+    void setUserLocation(double latitude, double longitude, std::optional<double> heading = std::nullopt);
+    void clearUserLocation();
+
+    // Dẫn đường: `lonLat` là mảng PHẲNG [lon, lat, lon, lat, ...] (marshal rẻ hơn mảng object).
+    // setRoute dựng/ghi lại toàn bộ tuyến; setRouteProgress chỉ dịch ranh giới đã đi/ còn lại
+    // (KHÔNG marshal lại toạ độ — tick 1 Hz); clearRoute dọn source + layer.
+    void setRoute(const std::vector<double>& lonLat);
+    void setRouteProgress(std::size_t travelledIndex);
+    void clearRoute();
 
     bool hasMap() const { return map != nullptr; }
     OHNativeWindow* getNativeWindow() const { return window; }
@@ -113,6 +131,7 @@ private:
         bool active = false;
         ZoomSessionOwner owner = ZoomSessionOwner::None;
         double pendingDelta = 0.0;
+        double startZoom = 0.0;
         std::chrono::steady_clock::time_point lastEvent{};
     };
 
@@ -174,6 +193,22 @@ private:
     bool lastGpuWaitSampled = false;
     std::function<void()> repaintCallback;
     std::unique_ptr<util::AsyncTask> asyncInvalidate;
+    void updateUserLocationPuck();
+    void ensureUserLocationBeamImage(mbgl::style::Style&);
+    void ensureUserLocationBeamLayer(mbgl::style::Style&);
+    void syncUserLocationBeam(mbgl::style::Style&);
+    std::optional<std::pair<double, double>> currentUserLocation;
+    std::optional<double> currentUserHeading;
+    bool userLocationBeamImageReady = false;
+
+    // Tuyến dẫn đường: dựng source/layer dưới lớp symbol đầu tiên để không che nhãn đường.
+    void ensureRouteLayers(mbgl::style::Style&);
+    void applyRouteGeoJSON(mbgl::style::Style&);
+    std::optional<std::string> firstSymbolLayerId(mbgl::style::Style&) const;
+    /** Toạ độ tuyến (lon, lat). Giữ lại để re-apply khi style load lại (reloadStyle). */
+    std::vector<std::pair<double, double>> routeCoords;
+    /** Đỉnh đã đi qua — ranh giới travelled/remaining, cập nhật mỗi tick. */
+    std::size_t routeTravelledIndex = 0;
 };
 
 } // namespace ohos

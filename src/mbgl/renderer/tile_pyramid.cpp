@@ -243,9 +243,12 @@ void TilePyramid::update(const std::vector<Immutable<style::LayerProperties>>& l
             std::max(static_cast<double>(parameters.transformState.getSize().width) / tileSize, 1.0) *
             std::max(static_cast<double>(parameters.transformState.getSize().height) / tileSize, 1.0) *
             (parameters.transformState.getMaxZoom() - parameters.transformState.getMinZoom() + 1) * 0.5);
-        // Smartwatch RAM Optimization: Giới hạn Tile Cache trong RAM ở mức 24 - 48 tiles
-        // Đủ rộng cho viewport 3x3 + viền khi quẹt qua lại, tránh liên tục purge & re-parse gây giật lag
-        conservativeCacheSize = std::clamp(conservativeCacheSize, size_t(24), size_t(48));
+        // Smartwatch RAM: 24–48 tile ở zoom gần (viewport 3×3 + viền). Zoom xa
+        // (covering < 10) hạ còn 8–12 để đổ tile đô thị z14–15, tránh OOM khi
+        // pyramid nhảy xuống z5–z8 (cả nước) trong khi cache vẫn giữ z15.
+        const size_t cacheMin = overscaledZoom < 10 ? size_t(8) : size_t(24);
+        const size_t cacheMax = overscaledZoom < 10 ? size_t(12) : size_t(48);
+        conservativeCacheSize = std::clamp(conservativeCacheSize, cacheMin, cacheMax);
         cache.setSize(conservativeCacheSize);
     } else {
         cache.setSize(0);

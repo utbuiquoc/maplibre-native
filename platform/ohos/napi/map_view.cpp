@@ -9,10 +9,20 @@
 
 #include <mbgl/math/angles.hpp>
 #include <mbgl/map/map_options.hpp>
+#include <mbgl/style/expression/image.hpp>
+#include <mbgl/style/image.hpp>
+#include <mbgl/style/layers/circle_layer.hpp>
+#include <mbgl/style/layers/line_layer.hpp>
+#include <mbgl/style/layers/symbol_layer.hpp>
 #include <mbgl/style/source.hpp>
+#include <mbgl/style/sources/geojson_source.hpp>
 #include <mbgl/style/style.hpp>
+#include <mbgl/style/types.hpp>
 #include <mbgl/util/async_task.hpp>
+#include <mbgl/util/color.hpp>
+#include <mbgl/util/geojson.hpp>
 #include <mbgl/util/client_options.hpp>
+#include <mbgl/util/image.hpp>
 #include <mbgl/util/logging.hpp>
 #include <mbgl/util/run_loop.hpp>
 #include <mbgl/util/string.hpp>
@@ -20,7 +30,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <exception>
+#include <numbers>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -49,6 +63,62 @@ ScreenCoordinate logicalCoordinateForFramebufferCoordinate(const double x, const
 }
 
 constexpr auto ZoomSessionIdle = std::chrono::milliseconds(WatchRenderPolicy::idleMilliseconds);
+
+constexpr const char* kUserLocationSource = "user_location_source";
+constexpr const char* kUserLocationPuck = "user_location_puck";
+constexpr const char* kUserLocationHalo = "user_location_halo";
+constexpr const char* kUserLocationBeam = "user_location_beam";
+constexpr const char* kUserLocationBeamImage = "user_location_beam_image";
+constexpr float kBeamIconSize = 0.56f;
+// Tuyến dẫn đường: 2 source (đã đi / còn lại) + 3 layer (casing, line, travelled).
+// Dùng 2 source thay vì filter để tránh phụ thuộc API expression của mbgl.
+constexpr const char* kRouteRemainingSource = "nav_route_remaining_source";
+constexpr const char* kRouteTravelledSource = "nav_route_travelled_source";
+constexpr const char* kRouteCasingLayer = "nav_route_casing";
+constexpr const char* kRouteLineLayer = "nav_route_line";
+constexpr const char* kRouteTravelledLayer = "nav_route_travelled";
+
+double normalizeHeadingDegrees(double heading) {
+    double wrapped = std::fmod(heading, 360.0);
+    if (wrapped < 0.0) {
+        wrapped += 360.0;
+    }
+    return wrapped;
+}
+
+PremultipliedImage makeHeadingBeamImage() {
+    constexpr std::uint32_t kSize = 256;
+    constexpr float kPi = std::numbers::pi_v<float>;
+    constexpr float kHalfAngle = 26.0f * kPi / 180.0f;
+    constexpr float kFeather = 7.0f * kPi / 180.0f;
+    PremultipliedImage image({kSize, kSize});
+    std::uint8_t* dst = image.data.get();
+    const float cx = (kSize - 1) * 0.5f;
+    const float cy = (kSize - 1) * 0.5f;
+    const float maxR = kSize * 0.5f;
+    for (std::uint32_t y = 0; y < kSize; ++y) {
+        for (std::uint32_t x = 0; x < kSize; ++x) {
+            const float dx = static_cast<float>(x) - cx;
+            const float dy = static_cast<float>(y) - cy;
+            const float dist = std::sqrt(dx * dx + dy * dy);
+            const float r = dist / maxR;
+            const float absAng = std::fabs(std::atan2(dx, -dy));
+            float angT = (absAng - kHalfAngle) / kFeather;
+            angT = std::clamp(angT, 0.0f, 1.0f);
+            angT = angT * angT * (3.0f - 2.0f * angT);
+            const float angMask = 1.0f - angT;
+            const float rad = std::clamp((r - 0.08f) / 0.92f, 0.0f, 1.0f);
+            const float radMask = (1.0f - rad) * (1.0f - rad);
+            const float a = angMask * radMask * 0.48f;
+            const std::size_t i = (static_cast<std::size_t>(y) * kSize + x) * 4;
+            dst[i + 0] = static_cast<std::uint8_t>(std::lround(0.10f * a * 255.0f));
+            dst[i + 1] = static_cast<std::uint8_t>(std::lround(0.45f * a * 255.0f));
+            dst[i + 2] = static_cast<std::uint8_t>(std::lround(0.91f * a * 255.0f));
+            dst[i + 3] = static_cast<std::uint8_t>(std::lround(a * 255.0f));
+        }
+    }
+    return image;
+}
 
 } // namespace
 
@@ -317,6 +387,15 @@ void MapView::endInteractionZoom() {
     }
 }
 
+void MapView::cancelTransitions() {
+    if (map) {
+        map->cancelTransitions();
+    }
+    hasPendingPan = false;
+    pendingPanX = 0.0;
+    pendingPanY = 0.0;
+}
+
 void MapView::moveBy(double x, double y, AnimationOptions animationOptions) {
     if (!map) {
         return;
@@ -394,7 +473,9 @@ void MapView::flyBy(double scale, double anchorX, double anchorY, AnimationOptio
     finishZoomSession();
     const auto currentCamera = map->getCameraOptions();
     const double currentZoom = currentCamera.zoom.value_or(0.0);
-    const double nextZoom = currentZoom + std::log2(scale);
+    // Clamp cùng policy với applyPendingZoomDelta: mọi đường zoom chung một trần/sàn.
+    const double nextZoom = std::clamp(currentZoom + std::log2(scale),
+                                       WatchRenderPolicy::minZoom, WatchRenderPolicy::maxZoom);
     map->flyTo(CameraOptions().withZoom(nextZoom).withAnchor(
                    logicalCoordinateForFramebufferCoordinate(anchorX, anchorY, pixelRatio)),
                std::move(animationOptions));
@@ -450,6 +531,7 @@ void MapView::startZoomSession(ZoomSessionOwner owner) {
     zoomSession.active = true;
     zoomSession.owner = owner;
     zoomSession.pendingDelta = 0.0;
+    zoomSession.startZoom = currentZoom();
     zoomSession.lastEvent = std::chrono::steady_clock::now();
     syncGestureFlag();
 }
@@ -496,9 +578,16 @@ void MapView::finishZoomSession() {
         return;
     }
 
+    const double startZoom = zoomSession.startZoom;
+    const double endZoom = currentZoom();
     zoomSession = {};
     applyCoveringZoomCap();
     syncGestureFlag();
+    // Zoom out ≥ 2 mức: đổ cache RAM của tile z cao (đô thị) trước khi
+    // parse tile z thấp (cả nước). Không gọi khi zoom in — tile gần còn dùng.
+    if (startZoom - endZoom >= 2.0) {
+        reduceMemoryUse();
+    }
 }
 
 void MapView::syncGestureFlag() {
@@ -686,10 +775,16 @@ void MapView::createMap(OHNativeWindow* newWindow, Size size) {
     // prefetch tải thừa tile cha (zoom Z-1) làm nghẽn mạng, tốn CPU parse và gây spike
     // upload GPU kép (25-30ms). Tắt hoàn toàn prefetch (delta = 0) theo quy chuẩn AGENTS.md.
     map->setPrefetchZoomDelta(0);
+    map->setTileLodMinRadius(WatchRenderPolicy::tileLodMinRadius);
 
-    if (!desiredBounds || !desiredBounds->maxZoom) {
+    {
         BoundOptions bounds = desiredBounds.value_or(BoundOptions());
-        bounds.withMaxZoom(WatchRenderPolicy::maxZoom).withMinZoom(WatchRenderPolicy::minZoom);
+        if (!bounds.maxZoom) {
+            bounds.withMaxZoom(WatchRenderPolicy::maxZoom);
+        }
+        const double minZ = bounds.minZoom ? std::max(*bounds.minZoom, WatchRenderPolicy::minZoom)
+                                           : WatchRenderPolicy::minZoom;
+        bounds.withMinZoom(minZ);
         desiredBounds = bounds;
     }
 
@@ -796,10 +891,29 @@ void MapView::onDidFinishLoadingMap() {
 
 void MapView::onDidFinishLoadingStyle() {
     styleLoaded = true;
+    userLocationBeamImageReady = false;
     if (!map) {
         return;
     }
     WatchRenderPolicy::applyStyle(map->getStyle());
+    if (currentUserLocation.has_value()) {
+        updateUserLocationPuck();
+    }
+    // Style reload xoá sạch source/layer ⇒ phải vẽ lại tuyến đang dẫn đường (gate A6:
+    // reloadStyle giữa phiên vẫn phải thấy tuyến).
+    if (!routeCoords.empty()) {
+        try {
+            ensureRouteLayers(map->getStyle());
+            applyRouteGeoJSON(map->getStyle());
+            if (repaintCallback) {
+                repaintCallback();
+            }
+        } catch (const std::exception& exception) {
+            Log::Warning(Event::General, std::string("route re-apply after style failed: ") + exception.what());
+        } catch (...) {
+            Log::Warning(Event::General, "route re-apply after style failed");
+        }
+    }
     try {
         const auto defaultCamera = map->getStyle().getDefaultCamera();
         if (!desiredCamera && !desiredCameraBounds && !desiredFreeCamera && defaultCamera.center &&
@@ -853,6 +967,313 @@ void MapView::resetRuntimeState() {
     lastStyleImageMissing.clear();
     lastGlyphsError.clear();
     lastSpritesError.clear();
+    userLocationBeamImageReady = false;
+}
+
+void MapView::setUserLocation(double latitude, double longitude, std::optional<double> heading) {
+    currentUserLocation = {latitude, longitude};
+    if (heading.has_value()) {
+        if (std::isfinite(*heading)) {
+            currentUserHeading = normalizeHeadingDegrees(*heading);
+        } else {
+            currentUserHeading.reset();
+        }
+    }
+    updateUserLocationPuck();
+}
+
+void MapView::clearUserLocation() {
+    currentUserLocation.reset();
+    currentUserHeading.reset();
+    if (map && styleLoaded) {
+        try {
+            auto& style = map->getStyle();
+            if (style.getLayer(kUserLocationPuck)) {
+                style.removeLayer(kUserLocationPuck);
+            }
+            if (style.getLayer(kUserLocationHalo)) {
+                style.removeLayer(kUserLocationHalo);
+            }
+            if (style.getLayer(kUserLocationBeam)) {
+                style.removeLayer(kUserLocationBeam);
+            }
+            if (style.getSource(kUserLocationSource)) {
+                style.removeSource(kUserLocationSource);
+            }
+            if (repaintCallback) {
+                repaintCallback();
+            }
+        } catch (...) {
+            // best-effort cleanup
+        }
+    }
+}
+
+void MapView::setRoute(const std::vector<double>& lonLat) {
+    routeCoords.clear();
+    const std::size_t count = lonLat.size() / 2;
+    routeCoords.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const double lng = lonLat[i * 2];
+        const double lat = lonLat[i * 2 + 1];
+        if (std::isfinite(lng) && std::isfinite(lat)) {
+            routeCoords.emplace_back(lng, lat);
+        }
+    }
+    routeTravelledIndex = 0;
+    if (!map || !styleLoaded || routeCoords.size() < 2) {
+        // Chưa có style ⇒ để onDidFinishLoadingStyle vẽ; tuyến < 2 điểm không phải LineString.
+        return;
+    }
+    try {
+        auto& style = map->getStyle();
+        ensureRouteLayers(style);
+        applyRouteGeoJSON(style);
+        if (repaintCallback) {
+            repaintCallback();
+        }
+    } catch (const std::exception& exception) {
+        Log::Warning(Event::General, std::string("setRoute failed: ") + exception.what());
+    } catch (...) {
+        Log::Warning(Event::General, "setRoute failed");
+    }
+}
+
+void MapView::setRouteProgress(std::size_t travelledIndex) {
+    if (routeCoords.empty()) {
+        return;
+    }
+    const std::size_t maxIndex = routeCoords.size() - 1;
+    const std::size_t clamped = travelledIndex > maxIndex ? maxIndex : travelledIndex;
+    if (clamped == routeTravelledIndex) {
+        return;
+    }
+    routeTravelledIndex = clamped;
+    if (!map || !styleLoaded) {
+        return;
+    }
+    try {
+        applyRouteGeoJSON(map->getStyle());
+        if (repaintCallback) {
+            repaintCallback();
+        }
+    } catch (const std::exception& exception) {
+        Log::Warning(Event::General, std::string("setRouteProgress failed: ") + exception.what());
+    } catch (...) {
+        Log::Warning(Event::General, "setRouteProgress failed");
+    }
+}
+
+void MapView::clearRoute() {
+    routeCoords.clear();
+    routeTravelledIndex = 0;
+    if (!map || !styleLoaded) {
+        return;
+    }
+    try {
+        auto& style = map->getStyle();
+        if (style.getLayer(kRouteCasingLayer)) {
+            style.removeLayer(kRouteCasingLayer);
+        }
+        if (style.getLayer(kRouteLineLayer)) {
+            style.removeLayer(kRouteLineLayer);
+        }
+        if (style.getLayer(kRouteTravelledLayer)) {
+            style.removeLayer(kRouteTravelledLayer);
+        }
+        if (style.getSource(kRouteRemainingSource)) {
+            style.removeSource(kRouteRemainingSource);
+        }
+        if (style.getSource(kRouteTravelledSource)) {
+            style.removeSource(kRouteTravelledSource);
+        }
+        if (repaintCallback) {
+            repaintCallback();
+        }
+    } catch (const std::exception& exception) {
+        Log::Warning(Event::General, std::string("clearRoute failed: ") + exception.what());
+    } catch (...) {
+        Log::Warning(Event::General, "clearRoute failed");
+    }
+}
+
+/**
+ * Chèn layer trước lớp symbol ĐẦU TIÊN để nhãn đường luôn nằm trên tuyến. Style chưa có
+ * symbol layer ⇒ trả nullopt và layer được thêm lên trên cùng (không còn cách nào tốt hơn).
+ */
+std::optional<std::string> MapView::firstSymbolLayerId(mbgl::style::Style& style) const {
+    for (auto* layer : style.getLayers()) {
+        if (!layer || !layer->getTypeInfo()) {
+            continue;
+        }
+        if (std::strcmp(layer->getTypeInfo()->type, "symbol") == 0) {
+            return layer->getID();
+        }
+    }
+    return std::nullopt;
+}
+
+void MapView::ensureRouteLayers(mbgl::style::Style& style) {
+    if (!style.getSource(kRouteRemainingSource)) {
+        style.addSource(std::make_unique<mbgl::style::GeoJSONSource>(kRouteRemainingSource));
+    }
+    if (!style.getSource(kRouteTravelledSource)) {
+        style.addSource(std::make_unique<mbgl::style::GeoJSONSource>(kRouteTravelledSource));
+    }
+    const std::optional<std::string> before = firstSymbolLayerId(style);
+
+    if (!style.getLayer(kRouteCasingLayer)) {
+        auto casing = std::make_unique<mbgl::style::LineLayer>(kRouteCasingLayer, kRouteRemainingSource);
+        casing->setLineCap(mbgl::style::LineCapType::Round);
+        casing->setLineJoin(mbgl::style::LineJoinType::Round);
+        casing->setLineWidth(WatchRenderPolicy::routeCasingWidth);
+        casing->setLineColor(mbgl::Color(WatchRenderPolicy::routeCasingR, WatchRenderPolicy::routeCasingG,
+            WatchRenderPolicy::routeCasingB, WatchRenderPolicy::routeCasingA));
+        style.addLayer(std::move(casing), before);
+    }
+    if (!style.getLayer(kRouteLineLayer)) {
+        auto line = std::make_unique<mbgl::style::LineLayer>(kRouteLineLayer, kRouteRemainingSource);
+        line->setLineCap(mbgl::style::LineCapType::Round);
+        line->setLineJoin(mbgl::style::LineJoinType::Round);
+        line->setLineWidth(WatchRenderPolicy::routeLineWidth);
+        line->setLineColor(mbgl::Color(WatchRenderPolicy::routeLineR, WatchRenderPolicy::routeLineG,
+            WatchRenderPolicy::routeLineB, WatchRenderPolicy::routeLineA));
+        style.addLayer(std::move(line), before);
+    }
+    if (!style.getLayer(kRouteTravelledLayer)) {
+        auto travelled = std::make_unique<mbgl::style::LineLayer>(kRouteTravelledLayer, kRouteTravelledSource);
+        travelled->setLineCap(mbgl::style::LineCapType::Round);
+        travelled->setLineJoin(mbgl::style::LineJoinType::Round);
+        travelled->setLineWidth(WatchRenderPolicy::routeLineWidth);
+        travelled->setLineColor(mbgl::Color(WatchRenderPolicy::routeTravelledR, WatchRenderPolicy::routeTravelledG,
+            WatchRenderPolicy::routeTravelledB, WatchRenderPolicy::routeTravelledA));
+        style.addLayer(std::move(travelled), before);
+    }
+}
+
+void MapView::applyRouteGeoJSON(mbgl::style::Style& style) {
+    auto* remaining = static_cast<mbgl::style::GeoJSONSource*>(style.getSource(kRouteRemainingSource));
+    auto* travelled = static_cast<mbgl::style::GeoJSONSource*>(style.getSource(kRouteTravelledSource));
+    if (!remaining || !travelled) {
+        return;
+    }
+    const std::size_t maxIndex = routeCoords.size() > 0 ? routeCoords.size() - 1 : 0;
+    const std::size_t split = routeTravelledIndex > maxIndex ? maxIndex : routeTravelledIndex;
+
+    mbgl::LineString<double> travelledLine;
+    if (split >= 1) {
+        for (std::size_t i = 0; i <= split; ++i) {
+            travelledLine.emplace_back(routeCoords[i].first, routeCoords[i].second);
+        }
+    }
+    mbgl::LineString<double> remainingLine;
+    if (routeCoords.size() >= 2 && split < routeCoords.size()) {
+        for (std::size_t i = split; i < routeCoords.size(); ++i) {
+            remainingLine.emplace_back(routeCoords[i].first, routeCoords[i].second);
+        }
+    }
+    travelled->setGeoJSON(mbgl::Geometry<double>{travelledLine});
+    remaining->setGeoJSON(mbgl::Geometry<double>{remainingLine});
+}
+
+void MapView::ensureUserLocationBeamImage(mbgl::style::Style& style) {
+    if (userLocationBeamImageReady) {
+        return;
+    }
+    style.addImage(std::make_unique<mbgl::style::Image>(
+        kUserLocationBeamImage, makeHeadingBeamImage(), 1.0f, false));
+    userLocationBeamImageReady = true;
+}
+
+void MapView::ensureUserLocationBeamLayer(mbgl::style::Style& style) {
+    if (style.getLayer(kUserLocationBeam)) {
+        return;
+    }
+    auto beamLayer = std::make_unique<mbgl::style::SymbolLayer>(kUserLocationBeam, kUserLocationSource);
+    beamLayer->setIconImage(mbgl::style::expression::Image(kUserLocationBeamImage));
+    beamLayer->setIconAnchor(mbgl::style::SymbolAnchorType::Center);
+    beamLayer->setIconAllowOverlap(true);
+    beamLayer->setIconIgnorePlacement(true);
+    beamLayer->setIconKeepUpright(false);
+    beamLayer->setIconPitchAlignment(mbgl::style::AlignmentType::Viewport);
+    beamLayer->setIconRotationAlignment(mbgl::style::AlignmentType::Map);
+    beamLayer->setIconSize(kBeamIconSize);
+    beamLayer->setVisibility(mbgl::style::VisibilityType::None);
+    if (style.getLayer(kUserLocationHalo)) {
+        style.addLayer(std::move(beamLayer), std::string(kUserLocationHalo));
+    } else {
+        style.addLayer(std::move(beamLayer));
+    }
+}
+
+void MapView::syncUserLocationBeam(mbgl::style::Style& style) {
+    auto* layer = style.getLayer(kUserLocationBeam);
+    if (!layer || !layer->getTypeInfo() || std::strcmp(layer->getTypeInfo()->type, "symbol") != 0) {
+        return;
+    }
+    auto* beam = static_cast<mbgl::style::SymbolLayer*>(layer);
+    if (currentUserHeading.has_value()) {
+        beam->setIconRotate(static_cast<float>(*currentUserHeading));
+        beam->setVisibility(mbgl::style::VisibilityType::Visible);
+    } else {
+        beam->setVisibility(mbgl::style::VisibilityType::None);
+    }
+}
+
+void MapView::updateUserLocationPuck() {
+    if (!map || !styleLoaded || !currentUserLocation.has_value()) {
+        return;
+    }
+    try {
+        auto& style = map->getStyle();
+        double lat = currentUserLocation->first;
+        double lng = currentUserLocation->second;
+
+        auto* source = static_cast<mbgl::style::GeoJSONSource*>(style.getSource(kUserLocationSource));
+        if (!source) {
+            auto newSource = std::make_unique<mbgl::style::GeoJSONSource>(kUserLocationSource);
+            style.addSource(std::move(newSource));
+            ensureUserLocationBeamImage(style);
+
+            // Chùm sáng định hướng (dưới halo + puck).
+            ensureUserLocationBeamLayer(style);
+
+            // Vòng hào quang xanh nhạt bán trong suốt
+            auto haloLayer = std::make_unique<mbgl::style::CircleLayer>(kUserLocationHalo, kUserLocationSource);
+            haloLayer->setCircleRadius(16.0f);
+            haloLayer->setCircleColor(mbgl::Color(0.10f, 0.45f, 0.91f, 0.22f)); // #1A73E8 22%
+            haloLayer->setCircleStrokeWidth(0.0f);
+            haloLayer->setCirclePitchAlignment(mbgl::style::AlignmentType::Viewport);
+            style.addLayer(std::move(haloLayer));
+
+            // Chấm xanh trung tâm viền trắng tinh khiết
+            auto puckLayer = std::make_unique<mbgl::style::CircleLayer>(kUserLocationPuck, kUserLocationSource);
+            puckLayer->setCircleRadius(7.0f);
+            puckLayer->setCircleColor(mbgl::Color(0.10f, 0.45f, 0.91f, 1.0f)); // #1A73E8
+            puckLayer->setCircleStrokeWidth(2.5f);
+            puckLayer->setCircleStrokeColor(mbgl::Color::white());
+            puckLayer->setCirclePitchAlignment(mbgl::style::AlignmentType::Viewport);
+            style.addLayer(std::move(puckLayer));
+
+            source = static_cast<mbgl::style::GeoJSONSource*>(style.getSource(kUserLocationSource));
+        } else {
+            ensureUserLocationBeamImage(style);
+            ensureUserLocationBeamLayer(style);
+        }
+
+        if (source) {
+            mbgl::Point<double> pt(lng, lat);
+            source->setGeoJSON(mbgl::Geometry<double>{pt});
+        }
+        syncUserLocationBeam(style);
+        if (repaintCallback) {
+            repaintCallback();
+        }
+    } catch (const std::exception& e) {
+        Log::Warning(Event::General, std::string("updateUserLocationPuck failed: ") + e.what());
+    } catch (...) {
+        Log::Warning(Event::General, "updateUserLocationPuck failed");
+    }
 }
 
 } // namespace ohos
